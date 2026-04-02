@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"✅ АНАЛИТИК (4H Развороты | 180 монет) АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
+    return f"✅ АНАЛИТИК v2.0 (Divergence + CVD Trend) АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -45,22 +45,39 @@ def calculate_rsi_wilder(closes, period=14):
     if avg_loss == 0: return 100
     return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-def calculate_cvd_logic(ohlcv, mode='long'):
-    if len(ohlcv) < 6: return False
+def get_cvd_data(ohlcv):
     cvd = []
     cum = 0.0
     for c in ohlcv:
         delta = c[5] if c[4] >= c[1] else -c[5]
         cum += delta
         cvd.append(cum)
+    return cvd
+
+def calculate_cvd_logic(ohlcv, cvd, mode='long'):
+    if len(ohlcv) < 10: return False
+    
+    curr_price = ohlcv[-1][4]
+    prev_price = ohlcv[-2][4]
+    curr_cvd = cvd[-1]
+    prev_cvd = cvd[-2]
+    
     if mode == 'long':
-        return ohlcv[-1][4] > ohlcv[-1][1] and cvd[-1] > 0 and (cvd[-3] > cvd[-2] < cvd[-1])
+        # Дивергенция: Цена ниже или равна прошлой, а CVD уже выше
+        divergence = curr_price <= prev_price and curr_cvd > prev_cvd
+        # Подтверждение: Закрытие в верхней половине свечи (откуп)
+        confirmation = (curr_price - ohlcv[-1][3]) > (ohlcv[-1][2] - curr_price)
+        return divergence and confirmation
     else:
-        return ohlcv[-1][4] < ohlcv[-1][1] and cvd[-1] < 0 and (cvd[-3] < cvd[-2] > cvd[-1])
+        # Дивергенция: Цена выше или равна прошлой, а CVD уже ниже
+        divergence = curr_price >= prev_price and curr_cvd < prev_cvd
+        # Подтверждение: Закрытие в нижней половине свечи (давление)
+        confirmation = (ohlcv[-1][2] - curr_price) > (curr_price - ohlcv[-1][3])
+        return divergence and confirmation
 
 def analyst_loop():
     sent_signals = {} 
-    logging.info("Аналитик запущен (180 монет, 4H).")
+    logging.info("Аналитик запущен (Divergence + Trend).")
     
     while True:
         try:
@@ -78,7 +95,6 @@ def analyst_loop():
                     vol = ticker_data.get('quoteVolume', 0) or 0
                     active_swaps.append({'symbol': symbol, 'vol': vol})
             
-            # Топ-180 по объему
             active_swaps.sort(key=lambda x: x['vol'], reverse=True)
             symbols = [x['symbol'] for x in active_swaps][:180]
 
@@ -91,24 +107,29 @@ def analyst_loop():
                     f_status = get_funding_status(funding)
                     tv = f"https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"
 
+                    # Тренд 1H (MA50)
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, '1h', limit=50)
-                    if ohlcv_1h and len(ohlcv_1h) == 50:
-                        ma50 = sum([c[4] for c in ohlcv_1h]) / 50
-                        ma_text = "🟢 Выше MA50" if price > ma50 else "🔴 Ниже MA50"
-                    else:
-                        ma_text = "⚪ Нет данных"
+                    ma50 = sum([c[4] for c in ohlcv_1h]) / 50 if len(ohlcv_1h) == 50 else price
+                    ma_text = "🟢 Выше MA50" if price > ma50 else "🔴 Ниже MA50"
 
+                    # Данные 4H
                     ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=30)
                     if not ohlcv_4h or len(ohlcv_4h) < 20: continue
+                    
+                    cvd_full = get_cvd_data(ohlcv_4h)
+                    # Определяем тренд CVD (за последние 5 свечей)
+                    cvd_trend_emoji = "📈 UP" if cvd_full[-1] > cvd_full[-5] else "📉 DOWN"
+                    
                     ts_4h = ohlcv_4h[-1][0]
                     rsi_4h = calculate_rsi_wilder([c[4] for c in ohlcv_4h])
                     vol_avg_4h = sum(c[5] for c in ohlcv_4h[-6:-1]) / 5
 
+                    # --- ЛОГИКА ЛОНГ ---
                     l_count = 0
-                    if funding < -0.0005: l_count += 1
+                    if funding < -0.0002: l_count += 1
                     if rsi_4h < 45: l_count += 1
-                    if calculate_cvd_logic(ohlcv_4h, 'long'): l_count += 1
-                    if ohlcv_4h[-1][5] > vol_avg_4h * 1.3: l_count += 1
+                    if calculate_cvd_logic(ohlcv_4h, cvd_full, 'long'): l_count += 1
+                    if ohlcv_4h[-1][5] > vol_avg_4h * 1.2: l_count += 1
                     low_24h = min(c[3] for c in ohlcv_4h[-6:])
                     if (price - low_24h) / low_24h < 0.03: l_count += 1
 
@@ -119,16 +140,18 @@ def analyst_loop():
                                f"Цена: <code>{price}</code>\n"
                                f"RSI (4h): {rsi_4h:.1f}\n"
                                f"Тренд 1h: {ma_text}\n"
+                               f"<b>CVD Тренд: {cvd_trend_emoji}</b>\n"
                                f"Фандинг: {f_status} <code>{f_pct:.4f}%</code>\n"
                                f"🔗 <a href='{tv}'>График</a>")
                         send_msg(msg)
                         sent_signals[l_key] = time.time()
 
+                    # --- ЛОГИКА ШОРТ ---
                     s_count = 0
-                    if funding > 0.0005: s_count += 1
+                    if funding > 0.0002: s_count += 1
                     if rsi_4h > 65: s_count += 1
-                    if calculate_cvd_logic(ohlcv_4h, 'short'): s_count += 1
-                    if ohlcv_4h[-1][5] > vol_avg_4h * 1.3: s_count += 1
+                    if calculate_cvd_logic(ohlcv_4h, cvd_full, 'short'): s_count += 1
+                    if ohlcv_4h[-1][5] > vol_avg_4h * 1.2: s_count += 1
                     high_24h = max(c[2] for c in ohlcv_4h[-6:])
                     if (high_24h - price) / price < 0.03: s_count += 1
 
@@ -139,6 +162,7 @@ def analyst_loop():
                                f"Цена: <code>{price}</code>\n"
                                f"RSI (4h): {rsi_4h:.1f}\n"
                                f"Тренд 1h: {ma_text}\n"
+                               f"<b>CVD Тренд: {cvd_trend_emoji}</b>\n"
                                f"Фандинг: {f_status} <code>{f_pct:.4f}%</code>\n"
                                f"🔗 <a href='{tv}'>График</a>")
                         send_msg(msg)
@@ -148,12 +172,13 @@ def analyst_loop():
                 except:
                     continue
 
+            # Очистка памяти
             now = time.time()
             sent_signals = {k: v for k, v in sent_signals.items() if v > (now - 86400)}
-            time.sleep(90) # Аналитику спешить некуда
+            time.sleep(120) 
             
         except Exception as e:
-            logging.error(f"Глобальная ошибка Аналитика: {e}")
+            logging.error(f"Глобальная ошибка: {e}")
             time.sleep(30)
 
 threading.Thread(target=analyst_loop, daemon=True).start()
