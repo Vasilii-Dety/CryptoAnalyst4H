@@ -6,13 +6,14 @@ import logging
 from datetime import datetime
 from flask import Flask
 import threading
+import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"✅ АНАЛИТИК v3.0 (Anti-Knife + Divergence) АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
+    return f"✅ АНАЛИТИК v3.4 (Ultimate) АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -28,11 +29,11 @@ def send_msg(text):
 
 def calculate_rsi_wilder(closes, period=14):
     if len(closes) < period + 1: return 50.0
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [max(0, d) for d in deltas]
-    losses = [max(0, -d) for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    deltas = np.diff(closes)
+    gains = deltas * (deltas > 0)
+    losses = -deltas * (deltas < 0)
+    avg_gain = gains[:period].mean()
+    avg_loss = losses[:period].mean()
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
@@ -49,29 +50,19 @@ def get_cvd_data(ohlcv):
     return cvd
 
 def check_reversal_patterns(ohlcv, cvd, mode='long'):
-    """
-    Улучшенная проверка: Дивергенция за 5 свечей + Свечной паттерн (Фитиль)
-    """
     if len(ohlcv) < 10: return False, False
-    
-    # Последняя свеча
     o, h, l, c, v = ohlcv[-1][1:6]
     body = abs(c - o)
-    
-    # Анализ фитилей (Price Action)
     if mode == 'long':
         lower_wick = min(o, c) - l
-        is_hammer = lower_wick > (body * 2) and c > l # Длинный хвост снизу
-        
-        # Дивергенция за 5 свечей
+        is_hammer = lower_wick > (body * 1.5)
         price_min_5 = min(x[3] for x in ohlcv[-6:-1])
         cvd_min_5 = min(cvd[-6:-1])
         divergence = l <= price_min_5 and cvd[-1] > cvd_min_5
         return divergence, is_hammer
     else:
         upper_wick = h - max(o, c)
-        is_star = upper_wick > (body * 2) and c < h # Длинный хвост сверху
-        
+        is_star = upper_wick > (body * 1.5)
         price_max_5 = max(x[2] for x in ohlcv[-6:-1])
         cvd_max_5 = max(cvd[-6:-1])
         divergence = h >= price_max_5 and cvd[-1] < cvd_max_5
@@ -79,59 +70,77 @@ def check_reversal_patterns(ohlcv, cvd, mode='long'):
 
 def analyst_loop():
     sent_signals = {} 
-    logging.info("Аналитик v3.0 запущен.")
+    logging.info("Аналитик v3.4 запущен.")
     
     while True:
         try:
             exchange.load_markets()
             tickers = exchange.fetch_tickers()
+            active_swaps = [s for s, m in exchange.markets.items() if m['active'] and m['type'] == 'swap' and m['quote'] == 'USDT']
             
-            active_swaps = []
-            for symbol, t in tickers.items():
-                market = exchange.markets.get(symbol)
-                if market and market.get('active') and market.get('type') == 'swap' and market.get('quote') == 'USDT':
-                    active_swaps.append({'symbol': symbol, 'vol': t.get('quoteVolume', 0) or 0})
-            
-            active_swaps.sort(key=lambda x: x['vol'], reverse=True)
-            symbols = [x['symbol'] for x in active_swaps][:180]
+            # Сортировка по объему (Топ 150)
+            symbols_to_check = []
+            for s in active_swaps:
+                if s in tickers:
+                    symbols_to_check.append({'s': s, 'v': tickers[s].get('quoteVolume', 0)})
+            symbols_to_check.sort(key=lambda x: x['v'], reverse=True)
+            symbols = [x['s'] for x in symbols_to_check[:150]]
 
             for symbol in symbols:
                 try:
-                    ticker = exchange.fetch_ticker(symbol)
-                    price = ticker['last']
-                    funding = float(ticker.get('info', {}).get('fundingRate', 0) or 0)
+                    ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=60)
+                    if not ohlcv_4h or len(ohlcv_4h) < 25: continue
                     
-                    ohlcv_4h = exchange.fetch_ohlcv(symbol, '4h', limit=30)
-                    if not ohlcv_4h or len(ohlcv_4h) < 20: continue
+                    # Данные текущей свечи
+                    ts_4h = ohlcv_4h[-1][0]
+                    o_curr, h_curr, l_curr, price, v_curr = ohlcv_4h[-1][1:6]
                     
+                    # 1. ОБЪЕМ (Средний за 20 свечей)
+                    v_history = [x[5] for x in ohlcv_4h[-21:-1]]
+                    v_avg = np.mean(v_history)
+                    v_rel = v_curr / v_avg if v_avg > 0 else 1.0
+                    
+                    # 2. ДИСБАЛАНС (Pressure)
+                    if h_curr != l_curr:
+                        buy_pressure = (price - l_curr) / (h_curr - l_curr)
+                    else:
+                        buy_pressure = 0.5
+                    imbalance_pct = ((buy_pressure - 0.5) * 2) * 100
+                    dom_str = f"🟢 <b>{abs(imbalance_pct):.0f}% Покупатели</b>" if imbalance_pct > 0 else f"🔴 <b>{abs(imbalance_pct):.0f}% Продавцы</b>"
+                    
+                    # 3. ИНДИКАТОРЫ
                     cvd_full = get_cvd_data(ohlcv_4h)
                     rsi_4h = calculate_rsi_wilder([c[4] for c in ohlcv_4h])
-                    ts_4h = ohlcv_4h[-1][0]
+                    candle_percent = ((price - o_curr) / o_curr) * 100
                     
-                    # --- ЛОГИКА ЛОНГ (Балльная система) ---
+                    # --- ЛОГИКА ЛОНГ (Баллы + Фильтры) ---
                     l_score = 0
                     l_details = []
-                    
                     div_l, hammer = check_reversal_patterns(ohlcv_4h, cvd_full, 'long')
                     
                     if div_l: l_score += 2; l_details.append("🔥 CVD Дивергенция")
                     if hammer: l_score += 1; l_details.append("⚓️ Выкуп (Фитиль)")
                     if rsi_4h < 35: l_score += 1; l_details.append("📉 RSI Перепроданность")
-                    if funding < -0.0005: l_score += 1; l_details.append("💰 Отриц. фандинг")
+                    if v_rel > 1.5: l_score += 1; l_details.append(f"📊 Объем (x{v_rel:.1f})")
 
+                    # ВЕТО ФИЛЬТРЫ
+                    veto_long = (rsi_4h >= 50) or (candle_percent < -4.0) # RSI Вето + Anti-Train
+                    
                     l_key = f"{symbol}_{ts_4h}_long"
-                    # Требуем минимум 3 балла, при этом Дивергенция или Фитиль ОБЯЗАТЕЛЬНЫ
-                    if l_score >= 3 and (div_l or hammer) and l_key not in sent_signals:
+                    if l_score >= 3 and (div_l or hammer) and not veto_long and l_key not in sent_signals:
                         msg = (f"🚨 <b>СИЛЬНЫЙ ЛОНГ 4H ({l_score}/5)</b>\n"
-                               f"Монета: {symbol}\n"
-                               f"Цена: <code>{price}</code>\n"
-                               f"RSI (4h): {rsi_4h:.1f}\n"
+                               f"Монета: <b>{symbol}</b>\n"
+                               f"Цена: <code>{price}</code> | RSI: {rsi_4h:.1f}\n"
                                f"Сигналы: {', '.join(l_details)}\n"
-                               f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}'>График</a>")
+                               f"───────────────────\n"
+                               f"📈 Рост объема: <b>x{v_rel:.1f}</b>\n"
+                               f"⚖️ Дисбаланс: {dom_str}\n"
+                               f"───────────────────\n"
+                               f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}'>Открыть график</a>")
                         send_msg(msg)
                         sent_signals[l_key] = time.time()
 
-                    # --- ЛОГИКА ШОРТ ---
+                    # --- ЛОГИКА ШОРТ (Баллы + Фильтры) ---
                     s_score = 0
                     s_details = []
                     div_s, star = check_reversal_patterns(ohlcv_4h, cvd_full, 'short')
@@ -139,25 +148,32 @@ def analyst_loop():
                     if div_s: s_score += 2; s_details.append("🔥 CVD Дивергенция")
                     if star: s_score += 1; s_details.append("☄️ Давление (Фитиль)")
                     if rsi_4h > 65: s_score += 1; s_details.append("📈 RSI Перекупленность")
-                    if funding > 0.0005: s_score += 1; s_details.append("💰 Полож. фандинг")
+                    if v_rel > 1.5: s_score += 1; s_details.append(f"📊 Объем (x{v_rel:.1f})")
 
+                    # ВЕТО ФИЛЬТРЫ
+                    veto_short = (rsi_4h <= 50) or (candle_percent > 4.0) # RSI Вето + Anti-Train
+                    
                     s_key = f"{symbol}_{ts_4h}_short"
-                    if s_score >= 3 and (div_s or star) and s_key not in sent_signals:
+                    if s_score >= 3 and (div_s or star) and not veto_short and s_key not in sent_signals:
                         msg = (f"❄️ <b>СИЛЬНЫЙ ШОРТ 4H ({s_score}/5)</b>\n"
-                               f"Монета: {symbol}\n"
-                               f"Цена: <code>{price}</code>\n"
-                               f"RSI (4h): {rsi_4h:.1f}\n"
+                               f"Монета: <b>{symbol}</b>\n"
+                               f"Цена: <code>{price}</code> | RSI: {rsi_4h:.1f}\n"
                                f"Сигналы: {', '.join(s_details)}\n"
-                               f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}'>График</a>")
+                               f"───────────────────\n"
+                               f"📉 Рост объема: <b>x{v_rel:.1f}</b>\n"
+                               f"⚖️ Дисбаланс: {dom_str}\n"
+                               f"───────────────────\n"
+                               f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}'>Открыть график</a>")
                         send_msg(msg)
                         sent_signals[s_key] = time.time()
-
-                    time.sleep(0.3)
+                        
+                    time.sleep(0.2)
                 except: continue
-
+            
+            # Очистка старых сигналов
             sent_signals = {k: v for k, v in sent_signals.items() if v > (time.time() - 86400)}
-            time.sleep(180) 
-        except: time.sleep(30)
+            time.sleep(300) # Пауза между кругами
+        except: time.sleep(60)
 
 threading.Thread(target=analyst_loop, daemon=True).start()
 
