@@ -23,7 +23,7 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
 
 exchange = ccxt.mexc({
     'enableRateLimit': True,
-    'timeout': 30000,
+    'timeout': 15000,
     'options': {'defaultType': 'swap'}
 })
 
@@ -33,6 +33,14 @@ WATCHLIST = [
     'ADA/USDT:USDT', 'AVAX/USDT:USDT', 'LINK/USDT:USDT',
     'DOT/USDT:USDT',
 ]
+
+bot_status = {
+    "started_at":     datetime.now().isoformat(),
+    "last_iteration": None,
+    "iterations":     0,
+    "errors":         0,
+    "signals_sent":   0,
+}
 
 
 def build_tv_link(symbol: str) -> str:
@@ -251,7 +259,6 @@ def update_td_counters(ohlcv, symbol, tf, mode='long'):
                 setup_bars = []
 
         elif in_c:
-            # Отмена Countdown если цена вышла за Setup диапазон
             if mode == 'long' and setup_high is not None and c > setup_high:
                 in_c       = False
                 c_count    = 0
@@ -306,26 +313,34 @@ def check_hammer(ohlcv, mode='long'):
 
 
 def get_market_context():
-    try:
-        btc        = exchange.fetch_ohlcv('BTC/USDT:USDT', '4h', limit=5)
-        btc_ch     = ((btc[-1][4] - btc[-2][4]) / btc[-2][4]) * 100
-        btc_trend  = "🟢" if btc_ch > -0.3 else "🔴"
-        eth_btc    = exchange.fetch_ohlcv('ETH/BTC', '4h', limit=5)
-        eth_btc_ch = ((eth_btc[-1][4] - eth_btc[-2][4]) / eth_btc[-2][4]) * 100
-        alt_power  = "🚀" if eth_btc_ch > 0.1 else "⚓️"
-        btc_moves  = [abs((btc[i][4] - btc[i-1][4]) / btc[i-1][4]) * 100 for i in range(1, 5)]
-        return {
-            "btc_trend": btc_trend,
-            "btc_ch":    btc_ch,
-            "btc_p":     btc[-1][4],
-            "alt_power": alt_power,
-            "alt_ch":    eth_btc_ch,
-            "btc_vol":   np.mean(btc_moves),
-        }
-    except Exception as e:
-        logging.error(f"Ошибка get_market_context: {e}")
-        return {"btc_trend": "⚪️", "btc_ch": 0, "btc_p": 0,
-                "alt_power": "⚪️", "alt_ch": 0, "btc_vol": 1.0}
+    for attempt in range(3):
+        try:
+            btc       = exchange.fetch_ohlcv('BTC/USDT:USDT', '4h', limit=5)
+            btc_ch    = ((btc[-1][4] - btc[-2][4]) / btc[-2][4]) * 100
+            btc_trend = "🟢" if btc_ch > -0.3 else "🔴"
+
+            # ETH/BTC спот недоступен на swap — сравниваем ETH vs BTC по % изменению
+            eth      = exchange.fetch_ohlcv('ETH/USDT:USDT', '4h', limit=5)
+            eth_ch   = ((eth[-1][4] - eth[-2][4]) / eth[-2][4]) * 100
+            alt_diff = eth_ch - btc_ch
+            alt_power = "🚀" if alt_diff > 0.5 else "⚓️"
+
+            btc_moves = [abs((btc[i][4] - btc[i-1][4]) / btc[i-1][4]) * 100
+                         for i in range(1, 5)]
+            return {
+                "btc_trend": btc_trend,
+                "btc_ch":    btc_ch,
+                "btc_p":     btc[-1][4],
+                "alt_power": alt_power,
+                "alt_ch":    alt_diff,
+                "btc_vol":   np.mean(btc_moves),
+            }
+        except Exception as e:
+            logging.warning(f"get_market_context попытка {attempt+1}/3: {e}")
+            time.sleep(5)
+    logging.error("get_market_context: все попытки исчерпаны")
+    return {"btc_trend": "⚪️", "btc_ch": 0, "btc_p": 0,
+            "alt_power": "⚪️", "alt_ch": 0, "btc_vol": 1.0}
 
 
 def adaptive_threshold(base: int, btc_vol: float, is_watchlist: bool) -> int:
@@ -387,8 +402,18 @@ def analyst_loop():
 
             for symbol in symbols:
                 try:
-                    ohlcv = exchange.fetch_ohlcv(symbol, '4h', limit=100)
-                    if len(ohlcv) < 60:
+                    ohlcv = None
+                    for attempt in range(2):
+                        try:
+                            ohlcv = exchange.fetch_ohlcv(symbol, '4h', limit=100)
+                            break
+                        except ccxt.NetworkError as e:
+                            if attempt == 0:
+                                logging.warning(f"fetch_ohlcv retry {symbol}: {e}")
+                                time.sleep(3)
+                            else:
+                                raise
+                    if ohlcv is None or len(ohlcv) < 60:
                         continue
 
                     is_wl         = symbol in WATCHLIST
@@ -442,7 +467,6 @@ def analyst_loop():
                     else:
                         stop_l = stop_s = target_l = target_s = None
 
-                    # Порог 5 (watchlist 4), минимум 3
                     threshold = adaptive_threshold(5, ctx['btc_vol'], is_wl)
 
                     # ════════════════════════
@@ -455,7 +479,6 @@ def analyst_loop():
                         if div_l:    l_score += 2; l_details.append("🔥 CVD Дивер")
                         if hammer_l: l_score += 1; l_details.append("⚓️ Фитиль")
 
-                        # RSI и MFI дедуплицированы — оба вместе дают +1, не +2
                         if rsi < 35 or mfi < 20:
                             l_score += 1
                             if rsi < 35 and mfi < 20:
@@ -470,7 +493,6 @@ def analyst_loop():
                             l_score += 2; l_details.append("🧱 Pivot Support")
                         elif current_price <= min(x[3] for x in closed[-60:]) * 1.015:
                             l_score += 1; l_details.append("🧱 Уровень")
-                        # alt_power убран из скоринга
                         if m9_l:
                             pts = 3 if m9_perfect_l else 2
                             l_score += pts
@@ -506,12 +528,13 @@ def analyst_loop():
                                 f"───────────────────\n"
                                 f"🌍 <b>МАРКЕТ:</b>\n"
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}% ({ctx['btc_p']:.0f})\n"
-                                f"🚀 Alt-Strength: {ctx['alt_power']} {ctx['alt_ch']:.2f}% (ETH/BTC)\n"
+                                f"🚀 Alt-Strength: {ctx['alt_power']} {ctx['alt_ch']:.2f}% (ETH vs BTC)\n"
                                 f"───────────────────\n"
                                 f"{tv_link}"
                             )
                             send_msg(msg)
                             sent_signals[l_key] = time.time()
+                            bot_status["signals_sent"] += 1
                             logging.info(f"ЛОНГ: {symbol} score={l_score} threshold={threshold} | {l_details}")
 
                     # ════════════════════════
@@ -573,12 +596,13 @@ def analyst_loop():
                                 f"───────────────────\n"
                                 f"🌍 <b>МАРКЕТ:</b>\n"
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}% ({ctx['btc_p']:.0f})\n"
-                                f"🚀 Alt-Strength: {ctx['alt_power']} {ctx['alt_ch']:.2f}% (ETH/BTC)\n"
+                                f"🚀 Alt-Strength: {ctx['alt_power']} {ctx['alt_ch']:.2f}% (ETH vs BTC)\n"
                                 f"───────────────────\n"
                                 f"{tv_link}"
                             )
                             send_msg(msg)
                             sent_signals[s_key] = time.time()
+                            bot_status["signals_sent"] += 1
                             logging.info(f"ШОРТ: {symbol} score={s_score} threshold={threshold} | {s_details}")
 
                     time.sleep(0.15)
@@ -594,18 +618,77 @@ def analyst_loop():
             now          = time.time()
             sent_signals = {k: v for k, v in sent_signals.items() if now - v < 86400}
 
+            bot_status["iterations"]    += 1
+            bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
             logging.info(f"Итерация завершена. Кэш: {len(sent_signals)}. BTC vol: {ctx['btc_vol']:.2f}%")
             time.sleep(300)
 
         except ccxt.NetworkError as e:
             logging.error(f"Глобальная сетевая ошибка: {e}")
+            bot_status["errors"] += 1
             time.sleep(60)
         except Exception as e:
             logging.error(f"Критическая ошибка: {e}")
+            bot_status["errors"] += 1
             time.sleep(60)
 
 
-threading.Thread(target=analyst_loop, daemon=True).start()
+@app.route('/health')
+def health():
+    uptime = str(datetime.now() - datetime.fromisoformat(bot_status["started_at"])).split('.')[0]
+    return (
+        f"✅ OK\n"
+        f"Uptime: {uptime}\n"
+        f"Итераций: {bot_status['iterations']}\n"
+        f"Ошибок: {bot_status['errors']}\n"
+        f"Сигналов отправлено: {bot_status['signals_sent']}\n"
+        f"Последняя итерация: {bot_status['last_iteration']}"
+    )
+
+
+# ─────────────────────────────────────────────
+# KEEPALIVE
+# Render Free засыпает если нет ВНЕШНИХ запросов.
+# Задай env переменную RENDER_EXTERNAL_URL =
+# https://твой-сервис.onrender.com
+# Render выставляет её автоматически в новых сервисах.
+# ─────────────────────────────────────────────
+def keepalive_loop():
+    time.sleep(30)
+    port         = int(os.environ.get("PORT", 10000))
+    external_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    local_url    = f"http://localhost:{port}/health"
+
+    while True:
+        urls = ([f"{external_url}/health"] if external_url else []) + [local_url]
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=15)
+                logging.info(f"Keepalive OK [{url}]: {r.status_code}")
+                break
+            except Exception as e:
+                logging.warning(f"Keepalive ошибка [{url}]: {e}")
+        time.sleep(240)
+
+
+def watchdog():
+    time.sleep(60)
+    while True:
+        global analyst_thread
+        if not analyst_thread.is_alive():
+            logging.error("⚠️ analyst_loop упал! Перезапускаем...")
+            bot_status["errors"] += 1
+            analyst_thread = threading.Thread(target=analyst_loop, daemon=True, name="analyst")
+            analyst_thread.start()
+            logging.info("analyst_loop перезапущен.")
+        time.sleep(60)
+
+
+analyst_thread = threading.Thread(target=analyst_loop, daemon=True, name="analyst")
+analyst_thread.start()
+
+threading.Thread(target=keepalive_loop, daemon=True, name="keepalive").start()
+threading.Thread(target=watchdog,       daemon=True, name="watchdog").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
