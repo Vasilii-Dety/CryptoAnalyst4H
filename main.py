@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"✅ АНАЛИТИК v3.8 АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
+    return f"✅ АНАЛИТИК v3.9 АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -119,7 +119,7 @@ def get_pivot_levels(ohlcv, tolerance=0.005):
 
 
 def calculate_atr(ohlcv, period=14):
-    """ATR по методу Wilder — быстрее реагирует на всплески волатильности."""
+    """ATR по методу Wilder."""
     if len(ohlcv) < period + 1:
         return None
     trs = []
@@ -135,7 +135,6 @@ def calculate_atr(ohlcv, period=14):
 
 
 def dynamic_atr_multipliers(btc_vol: float):
-    """Динамические коэффициенты стопа и тейка по волатильности BTC."""
     if btc_vol > 3.0:
         stop_k, take_k = 2.0, 3.0
     elif btc_vol > 1.5:
@@ -146,7 +145,6 @@ def dynamic_atr_multipliers(btc_vol: float):
 
 
 def calculate_mfi(ohlcv, period=14):
-    """MFI — RSI взвешенный по объёму. <20 лонг сигнал, >80 шорт."""
     if len(ohlcv) < period + 1:
         return 50.0
     tp_prev = None
@@ -189,74 +187,110 @@ def calculate_rsi_wilder(closes, period=14):
 
 def update_td_counters(ohlcv, symbol, tf, mode='long'):
     """
-    Полный пересчёт TD Setup и Countdown с нуля по закрытым свечам.
-    Не использует глобальное состояние — каждый вызов независим.
-    Результат детерминированный: те же свечи → тот же ответ всегда.
+    Полный пересчёт TD Setup (M9) и Countdown (M13) с нуля.
+    Каждый вызов независим — нет глобального состояния.
 
-    TD Setup (M9):
-      9 последовательных свечей подряд, каждая закрывается
-      ниже (long) / выше (short) закрытия свечи 4 бара назад.
-      Прерывание любой свечи — сброс счётчика.
-
-    TD Countdown (M13):
-      После завершения Setup считаем бары где
-      close <= low[-2] (long) или close >= high[-2] (short).
-      Необязательно подряд. Сброс если >30 баров без завершения.
-
-    Возвращает (m9_signal, m13_signal) — True только если сигнал
-    пришёлся на ПОСЛЕДНЮЮ закрытую свечу.
+    Perfect Setup: low свечи 8 или 9 ниже low свечей 6 и 7 (для buy).
+    Отмена Countdown: цена закрылась выше setup_high (buy) / ниже setup_low (sell).
+    Возвращает (m9_signal, m9_perfect, m13_signal).
     """
-    closed   = ohlcv[:-1]
-    closes   = [x[4] for x in closed]
-    lows     = [x[3] for x in closed]
-    highs    = [x[2] for x in closed]
+    closed = ohlcv[:-1]
+    closes = [x[4] for x in closed]
+    lows   = [x[3] for x in closed]
+    highs  = [x[2] for x in closed]
+    n      = len(closes)
 
-    if len(closes) < 14:
-        return False, False
+    if n < 14:
+        return False, False, False
 
     s_count    = 0
     in_c       = False
     c_count    = 0
+    setup_high = None
+    setup_low  = None
+    setup_bars = []
     m9_signal  = False
+    m9_perfect = False
     m13_signal = False
-    last_idx   = len(closes) - 1
+    last_idx   = n - 1
 
-    for i in range(4, len(closes)):
+    for i in range(4, n):
         c  = closes[i]
         c4 = closes[i - 4]
-
         setup_cond = (c < c4) if mode == 'long' else (c > c4)
 
         if not in_c:
             if setup_cond:
                 s_count += 1
+                setup_bars.append(i)
                 if s_count == 9:
+                    if len(setup_bars) >= 9:
+                        idx6, idx7 = setup_bars[-4], setup_bars[-3]
+                        idx8, idx9 = setup_bars[-2], setup_bars[-1]
+                        if mode == 'long':
+                            perfect = (lows[idx8] < lows[idx6] and lows[idx8] < lows[idx7]) or \
+                                      (lows[idx9] < lows[idx6] and lows[idx9] < lows[idx7])
+                        else:
+                            perfect = (highs[idx8] > highs[idx6] and highs[idx8] > highs[idx7]) or \
+                                      (highs[idx9] > highs[idx6] and highs[idx9] > highs[idx7])
+                    else:
+                        perfect = False
+
                     if i == last_idx:
-                        m9_signal = True
-                    in_c    = True
-                    c_count = 0
-                    s_count = 0
+                        m9_signal  = True
+                        m9_perfect = perfect
+
+                    setup_high  = max(highs[b] for b in setup_bars)
+                    setup_low   = min(lows[b]  for b in setup_bars)
+                    in_c        = True
+                    c_count     = 0
+                    s_count     = 0
+                    setup_bars  = []
             else:
-                s_count = 0
+                s_count    = 0
+                setup_bars = []
 
-        if in_c and i >= 2:
-            cd_cond = (c <= lows[i - 2]) if mode == 'long' else (c >= highs[i - 2])
-            if cd_cond:
-                c_count += 1
-                if c_count == 13:
-                    if i == last_idx:
-                        m13_signal = True
-                    in_c    = False
-                    c_count = 0
-            if c_count > 30:
-                in_c    = False
-                c_count = 0
+        elif in_c:
+            # Отмена Countdown если цена вышла за Setup диапазон
+            if mode == 'long' and setup_high is not None and c > setup_high:
+                in_c       = False
+                c_count    = 0
+                setup_high = None
+                setup_low  = None
+                s_count    = 1 if setup_cond else 0
+                setup_bars = [i] if setup_cond else []
+                continue
+            elif mode == 'short' and setup_low is not None and c < setup_low:
+                in_c       = False
+                c_count    = 0
+                setup_high = None
+                setup_low  = None
+                s_count    = 1 if setup_cond else 0
+                setup_bars = [i] if setup_cond else []
+                continue
 
-    return m9_signal, m13_signal
+            if i >= 2:
+                cd_cond = (c <= lows[i - 2]) if mode == 'long' else (c >= highs[i - 2])
+                if cd_cond:
+                    c_count += 1
+                    if c_count == 13:
+                        if i == last_idx:
+                            m13_signal = True
+                        in_c       = False
+                        c_count    = 0
+                        setup_high = None
+                        setup_low  = None
+
+            if in_c and c_count > 30:
+                in_c       = False
+                c_count    = 0
+                setup_high = None
+                setup_low  = None
+
+    return m9_signal, m9_perfect, m13_signal
 
 
 def check_hammer(ohlcv, mode='long'):
-    """Анализирует последнюю ЗАКРЫТУЮ свечу (ohlcv[-2])."""
     if len(ohlcv) < 2:
         return False
     candle     = ohlcv[-2]
@@ -295,12 +329,6 @@ def get_market_context():
 
 
 def adaptive_threshold(base: int, btc_vol: float, is_watchlist: bool) -> int:
-    """
-    Адаптивный порог скора.
-    BTC волатильность >3% → +2 к порогу (шумный рынок).
-    Тихий рынок <0.5%    → -1 к порогу.
-    Watchlist монеты      → ещё -1.
-    """
     threshold = base
     if btc_vol > 3.0:
         threshold += 2
@@ -308,12 +336,12 @@ def adaptive_threshold(base: int, btc_vol: float, is_watchlist: bool) -> int:
         threshold -= 1
     if is_watchlist:
         threshold -= 1
-    return max(threshold, 2)
+    return max(threshold, 3)
 
 
 def analyst_loop():
     sent_signals = {}
-    logging.info("Аналитик v3.8 запущен.")
+    logging.info("Аналитик v3.9 запущен.")
 
     try:
         exchange.load_markets()
@@ -402,8 +430,8 @@ def analyst_loop():
                     hammer_l = check_hammer(ohlcv, 'long')
                     hammer_s = check_hammer(ohlcv, 'short')
 
-                    m9_l, m13_l = update_td_counters(ohlcv, symbol, '4h', 'long')
-                    m9_s, m13_s = update_td_counters(ohlcv, symbol, '4h', 'short')
+                    m9_l, m9_perfect_l, m13_l = update_td_counters(ohlcv, symbol, '4h', 'long')
+                    m9_s, m9_perfect_s, m13_s = update_td_counters(ohlcv, symbol, '4h', 'short')
 
                     stop_k, take_k, rr_str = dynamic_atr_multipliers(ctx['btc_vol'])
                     if atr:
@@ -414,7 +442,8 @@ def analyst_loop():
                     else:
                         stop_l = stop_s = target_l = target_s = None
 
-                    threshold = adaptive_threshold(4, ctx['btc_vol'], is_wl)
+                    # Порог 5 (watchlist 4), минимум 3
+                    threshold = adaptive_threshold(5, ctx['btc_vol'], is_wl)
 
                     # ════════════════════════
                     # ЛОНГ
@@ -425,15 +454,27 @@ def analyst_loop():
 
                         if div_l:    l_score += 2; l_details.append("🔥 CVD Дивер")
                         if hammer_l: l_score += 1; l_details.append("⚓️ Фитиль")
-                        if rsi < 35: l_score += 1; l_details.append(f"📉 RSI {rsi:.0f}")
-                        if mfi < 20: l_score += 1; l_details.append(f"💰 MFI {mfi:.0f}")
+
+                        # RSI и MFI дедуплицированы — оба вместе дают +1, не +2
+                        if rsi < 35 or mfi < 20:
+                            l_score += 1
+                            if rsi < 35 and mfi < 20:
+                                l_details.append(f"📉 RSI {rsi:.0f} + MFI {mfi:.0f}")
+                            elif rsi < 35:
+                                l_details.append(f"📉 RSI {rsi:.0f}")
+                            else:
+                                l_details.append(f"💰 MFI {mfi:.0f}")
+
                         if v_rel > 1.8: l_score += 1; l_details.append(f"📊 Vol x{v_rel:.1f}")
                         if current_price <= sup * 1.015:
                             l_score += 2; l_details.append("🧱 Pivot Support")
                         elif current_price <= min(x[3] for x in closed[-60:]) * 1.015:
                             l_score += 1; l_details.append("🧱 Уровень")
-                        if ctx['alt_power'] == "🚀": l_score += 1
-                        if m9_l:  l_score += 2; l_details.append("⏱ M9 Setup")
+                        # alt_power убран из скоринга
+                        if m9_l:
+                            pts = 3 if m9_perfect_l else 2
+                            l_score += pts
+                            l_details.append("⏱ M9 Setup ✨" if m9_perfect_l else "⏱ M9 Setup")
                         if m13_l: l_score += 3; l_details.append("⏱ M13 Reversal")
 
                         is_strong_l  = v_rel > 3.5 and imb > 75
@@ -444,7 +485,6 @@ def analyst_loop():
                             wl_badge = " | ⭐️ WL" if is_wl else ""
                             status   = "⚡️ СИЛЬНЕЕ РЫНКА / DeMark M13" if (is_strong_l or m13_l) and btc_is_red else "✅ ТРЕНД"
                             tv_link  = build_tv_link(symbol)
-
                             atr_block = ""
                             if atr and stop_l and target_l:
                                 atr_block = (
@@ -453,7 +493,6 @@ def analyst_loop():
                                     f"🛑 Стоп:  <code>{stop_l:.6g}</code>  (-{((1-stop_l/current_price)*100):.1f}%)\n"
                                     f"⚡️ ATR:   <code>{atr:.6g}</code> | R/R ≈ {rr_str}\n"
                                 )
-
                             msg = (
                                 f"🚨 <b>ЛОНГ 4H ({l_score}/10){wl_badge}</b>\n"
                                 f"Монета: <b>{symbol}</b> | {status}\n"
@@ -484,15 +523,25 @@ def analyst_loop():
 
                         if div_s:    s_score += 2; s_details.append("🔥 CVD Дивер")
                         if hammer_s: s_score += 1; s_details.append("🏹 Фитиль вверх")
-                        if rsi > 65: s_score += 1; s_details.append(f"📈 RSI {rsi:.0f}")
-                        if mfi > 80: s_score += 1; s_details.append(f"💰 MFI {mfi:.0f}")
+
+                        if rsi > 65 or mfi > 80:
+                            s_score += 1
+                            if rsi > 65 and mfi > 80:
+                                s_details.append(f"📈 RSI {rsi:.0f} + MFI {mfi:.0f}")
+                            elif rsi > 65:
+                                s_details.append(f"📈 RSI {rsi:.0f}")
+                            else:
+                                s_details.append(f"💰 MFI {mfi:.0f}")
+
                         if v_rel > 1.8: s_score += 1; s_details.append(f"📊 Vol x{v_rel:.1f}")
                         if current_price >= res * 0.985:
                             s_score += 2; s_details.append("🧱 Pivot Resistance")
                         elif current_price >= max(x[2] for x in closed[-60:]) * 0.985:
                             s_score += 1; s_details.append("🧱 Уровень")
-                        if ctx['alt_power'] == "⚓️": s_score += 1
-                        if m9_s:  s_score += 2; s_details.append("⏱ M9 Setup")
+                        if m9_s:
+                            pts = 3 if m9_perfect_s else 2
+                            s_score += pts
+                            s_details.append("⏱ M9 Setup ✨" if m9_perfect_s else "⏱ M9 Setup")
                         if m13_s: s_score += 3; s_details.append("⏱ M13 Reversal")
 
                         is_strong_s  = v_rel > 3.5 and imb < -75
@@ -503,7 +552,6 @@ def analyst_loop():
                             wl_badge = " | ⭐️ WL" if is_wl else ""
                             status   = "⚡️ ПРОТИВ РЫНКА / DeMark M13" if (is_strong_s or m13_s) and btc_is_green else "🔻 ШОРТ"
                             tv_link  = build_tv_link(symbol)
-
                             atr_block = ""
                             if atr and stop_s and target_s:
                                 atr_block = (
@@ -512,7 +560,6 @@ def analyst_loop():
                                     f"🛑 Стоп:  <code>{stop_s:.6g}</code>  (+{((stop_s/current_price-1)*100):.1f}%)\n"
                                     f"⚡️ ATR:   <code>{atr:.6g}</code> | R/R ≈ {rr_str}\n"
                                 )
-
                             msg = (
                                 f"🚨 <b>ШОРТ 4H ({s_score}/10){wl_badge}</b>\n"
                                 f"Монета: <b>{symbol}</b> | {status}\n"
