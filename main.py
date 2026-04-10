@@ -127,7 +127,6 @@ def get_pivot_levels(ohlcv, tolerance=0.005):
 
 
 def calculate_atr(ohlcv, period=14):
-    """ATR по методу Wilder."""
     if len(ohlcv) < period + 1:
         return None
     trs = []
@@ -196,10 +195,9 @@ def calculate_rsi_wilder(closes, period=14):
 def update_td_counters(ohlcv, symbol, tf, mode='long'):
     """
     Полный пересчёт TD Setup (M9) и Countdown (M13) с нуля.
-    Каждый вызов независим — нет глобального состояния.
-
-    Perfect Setup: low свечи 8 или 9 ниже low свечей 6 и 7 (для buy).
-    Отмена Countdown: цена закрылась выше setup_high (buy) / ниже setup_low (sell).
+    Нет глобального состояния — каждый вызов независим.
+    Perfect Setup: low свечи 8 или 9 ниже low свечей 6 и 7 (buy).
+    Отмена Countdown: цена вышла за диапазон Setup.
     Возвращает (m9_signal, m9_perfect, m13_signal).
     """
     closed = ohlcv[:-1]
@@ -243,11 +241,9 @@ def update_td_counters(ohlcv, symbol, tf, mode='long'):
                                       (highs[idx9] > highs[idx6] and highs[idx9] > highs[idx7])
                     else:
                         perfect = False
-
                     if i == last_idx:
                         m9_signal  = True
                         m9_perfect = perfect
-
                     setup_high  = max(highs[b] for b in setup_bars)
                     setup_low   = min(lows[b]  for b in setup_bars)
                     in_c        = True
@@ -260,19 +256,13 @@ def update_td_counters(ohlcv, symbol, tf, mode='long'):
 
         elif in_c:
             if mode == 'long' and setup_high is not None and c > setup_high:
-                in_c       = False
-                c_count    = 0
-                setup_high = None
-                setup_low  = None
-                s_count    = 1 if setup_cond else 0
+                in_c = False; c_count = 0; setup_high = None; setup_low = None
+                s_count = 1 if setup_cond else 0
                 setup_bars = [i] if setup_cond else []
                 continue
             elif mode == 'short' and setup_low is not None and c < setup_low:
-                in_c       = False
-                c_count    = 0
-                setup_high = None
-                setup_low  = None
-                s_count    = 1 if setup_cond else 0
+                in_c = False; c_count = 0; setup_high = None; setup_low = None
+                s_count = 1 if setup_cond else 0
                 setup_bars = [i] if setup_cond else []
                 continue
 
@@ -283,16 +273,10 @@ def update_td_counters(ohlcv, symbol, tf, mode='long'):
                     if c_count == 13:
                         if i == last_idx:
                             m13_signal = True
-                        in_c       = False
-                        c_count    = 0
-                        setup_high = None
-                        setup_low  = None
+                        in_c = False; c_count = 0; setup_high = None; setup_low = None
 
             if in_c and c_count > 30:
-                in_c       = False
-                c_count    = 0
-                setup_high = None
-                setup_low  = None
+                in_c = False; c_count = 0; setup_high = None; setup_low = None
 
     return m9_signal, m9_perfect, m13_signal
 
@@ -318,22 +302,15 @@ def get_market_context():
             btc       = exchange.fetch_ohlcv('BTC/USDT:USDT', '4h', limit=5)
             btc_ch    = ((btc[-1][4] - btc[-2][4]) / btc[-2][4]) * 100
             btc_trend = "🟢" if btc_ch > -0.3 else "🔴"
-
-            # ETH/BTC спот недоступен на swap — сравниваем ETH vs BTC по % изменению
-            eth      = exchange.fetch_ohlcv('ETH/USDT:USDT', '4h', limit=5)
-            eth_ch   = ((eth[-1][4] - eth[-2][4]) / eth[-2][4]) * 100
-            alt_diff = eth_ch - btc_ch
+            eth       = exchange.fetch_ohlcv('ETH/USDT:USDT', '4h', limit=5)
+            eth_ch    = ((eth[-1][4] - eth[-2][4]) / eth[-2][4]) * 100
+            alt_diff  = eth_ch - btc_ch
             alt_power = "🚀" if alt_diff > 0.5 else "⚓️"
-
-            btc_moves = [abs((btc[i][4] - btc[i-1][4]) / btc[i-1][4]) * 100
-                         for i in range(1, 5)]
+            btc_moves = [abs((btc[i][4] - btc[i-1][4]) / btc[i-1][4]) * 100 for i in range(1, 5)]
             return {
-                "btc_trend": btc_trend,
-                "btc_ch":    btc_ch,
-                "btc_p":     btc[-1][4],
-                "alt_power": alt_power,
-                "alt_ch":    alt_diff,
-                "btc_vol":   np.mean(btc_moves),
+                "btc_trend": btc_trend, "btc_ch": btc_ch,
+                "btc_p": btc[-1][4], "alt_power": alt_power,
+                "alt_ch": alt_diff, "btc_vol": np.mean(btc_moves),
             }
         except Exception as e:
             logging.warning(f"get_market_context попытка {attempt+1}/3: {e}")
@@ -343,13 +320,13 @@ def get_market_context():
             "alt_power": "⚪️", "alt_ch": 0, "btc_vol": 1.0}
 
 
-def adaptive_threshold(base: int, btc_vol: float, is_watchlist: bool) -> int:
+def adaptive_threshold(base: int, btc_vol: float, is_priority: bool) -> int:
     threshold = base
     if btc_vol > 3.0:
         threshold += 2
     elif btc_vol < 0.5:
         threshold -= 1
-    if is_watchlist:
+    if is_priority:
         threshold -= 1
     return max(threshold, 3)
 
@@ -389,15 +366,40 @@ def analyst_loop():
                 s for s, m in exchange.markets.items()
                 if m.get('active') and m.get('type') == 'swap'
             ]
-            top150 = [
-                x['s'] for x in sorted(
-                    [{'s': s, 'v': tickers[s].get('quoteVolume', 0)}
-                     for s in active_swaps if s in tickers],
-                    key=lambda x: x['v'], reverse=True
-                )[:150]
+
+            # Данные объёма для всех свапов
+            vol_data = [
+                {'s': s, 'v': tickers[s].get('quoteVolume', 0)}
+                for s in active_swaps if s in tickers
             ]
+
+            # Топ-150 по абсолютному объёму
+            top150 = [
+                x['s'] for x in sorted(vol_data, key=lambda x: x['v'], reverse=True)[:150]
+            ]
+
+            # Топ-80 по ВЗРЫВУ объёма — ловим PARTI-подобные монеты
+            # Берём монеты вне топ-150 с объёмом > 50k USDT
+            # и отбираем те у кого объём >= 3× среднего по "тихим" монетам
+            volume_spike = [
+                {'s': x['s'], 'v': x['v']}
+                for x in vol_data
+                if x['s'] not in top150 and x['v'] > 50_000
+            ]
+            spike_top80 = []
+            if volume_spike:
+                outside_vols = [x['v'] for x in volume_spike]
+                avg_outside  = np.mean(outside_vols)
+                spike_top80  = [
+                    x['s'] for x in sorted(volume_spike, key=lambda x: x['v'], reverse=True)
+                    if x['v'] >= avg_outside * 3.0
+                ][:80]
+                if spike_top80:
+                    logging.info(f"🔥 Взрыв объёма: {len(spike_top80)} монет добавлено")
+
+            # Итог: watchlist (приоритет) + топ-150 + взрыв объёма
             symbols = list(dict.fromkeys(
-                [w for w in WATCHLIST if w in tickers] + top150
+                [w for w in WATCHLIST if w in tickers] + top150 + spike_top80
             ))
 
             for symbol in symbols:
@@ -416,7 +418,11 @@ def analyst_loop():
                     if ohlcv is None or len(ohlcv) < 60:
                         continue
 
-                    is_wl         = symbol in WATCHLIST
+                    is_wl    = symbol in WATCHLIST
+                    is_spike = symbol in spike_top80
+                    # Watchlist и spike монеты: порог на 1 балл мягче
+                    threshold = adaptive_threshold(5, ctx['btc_vol'], is_wl or is_spike)
+
                     current_price = ohlcv[-1][4]
                     closed        = ohlcv[:-1]
                     closes_closed = [x[4] for x in closed]
@@ -444,10 +450,7 @@ def analyst_loop():
                     c_high  = closed[-1][2]
                     c_low   = closed[-1][3]
                     c_close = closed[-1][4]
-                    if c_high != c_low:
-                        buy_pressure = (c_close - c_low) / (c_high - c_low)
-                    else:
-                        buy_pressure = 0.5
+                    buy_pressure = (c_close - c_low) / (c_high - c_low) if c_high != c_low else 0.5
                     imb = (buy_pressure - 0.5) * 200
 
                     div_l    = get_cvd_divergence(symbol, closed, 'long')
@@ -467,8 +470,6 @@ def analyst_loop():
                     else:
                         stop_l = stop_s = target_l = target_s = None
 
-                    threshold = adaptive_threshold(5, ctx['btc_vol'], is_wl)
-
                     # ════════════════════════
                     # ЛОНГ
                     # ════════════════════════
@@ -478,7 +479,6 @@ def analyst_loop():
 
                         if div_l:    l_score += 2; l_details.append("🔥 CVD Дивер")
                         if hammer_l: l_score += 1; l_details.append("⚓️ Фитиль")
-
                         if rsi < 35 or mfi < 20:
                             l_score += 1
                             if rsi < 35 and mfi < 20:
@@ -487,7 +487,6 @@ def analyst_loop():
                                 l_details.append(f"📉 RSI {rsi:.0f}")
                             else:
                                 l_details.append(f"💰 MFI {mfi:.0f}")
-
                         if v_rel > 1.8: l_score += 1; l_details.append(f"📊 Vol x{v_rel:.1f}")
                         if current_price <= sup * 1.015:
                             l_score += 2; l_details.append("🧱 Pivot Support")
@@ -504,7 +503,7 @@ def analyst_loop():
                         macro_veto_l = btc_is_red and not (is_strong_l or m13_l)
 
                         if l_score >= threshold and not macro_veto_l:
-                            wl_badge = " | ⭐️ WL" if is_wl else ""
+                            wl_badge = " | ⭐️ WL" if is_wl else (" | 🔥 VOL" if is_spike else "")
                             status   = "⚡️ СИЛЬНЕЕ РЫНКА / DeMark M13" if (is_strong_l or m13_l) and btc_is_red else "✅ ТРЕНД"
                             tv_link  = build_tv_link(symbol)
                             atr_block = ""
@@ -535,7 +534,7 @@ def analyst_loop():
                             send_msg(msg)
                             sent_signals[l_key] = time.time()
                             bot_status["signals_sent"] += 1
-                            logging.info(f"ЛОНГ: {symbol} score={l_score} threshold={threshold} | {l_details}")
+                            logging.info(f"ЛОНГ: {symbol} score={l_score} thr={threshold} | {l_details}")
 
                     # ════════════════════════
                     # ШОРТ
@@ -546,7 +545,6 @@ def analyst_loop():
 
                         if div_s:    s_score += 2; s_details.append("🔥 CVD Дивер")
                         if hammer_s: s_score += 1; s_details.append("🏹 Фитиль вверх")
-
                         if rsi > 65 or mfi > 80:
                             s_score += 1
                             if rsi > 65 and mfi > 80:
@@ -555,7 +553,6 @@ def analyst_loop():
                                 s_details.append(f"📈 RSI {rsi:.0f}")
                             else:
                                 s_details.append(f"💰 MFI {mfi:.0f}")
-
                         if v_rel > 1.8: s_score += 1; s_details.append(f"📊 Vol x{v_rel:.1f}")
                         if current_price >= res * 0.985:
                             s_score += 2; s_details.append("🧱 Pivot Resistance")
@@ -572,7 +569,7 @@ def analyst_loop():
                         macro_veto_s = btc_is_green and not (is_strong_s or m13_s)
 
                         if s_score >= threshold and not macro_veto_s:
-                            wl_badge = " | ⭐️ WL" if is_wl else ""
+                            wl_badge = " | ⭐️ WL" if is_wl else (" | 🔥 VOL" if is_spike else "")
                             status   = "⚡️ ПРОТИВ РЫНКА / DeMark M13" if (is_strong_s or m13_s) and btc_is_green else "🔻 ШОРТ"
                             tv_link  = build_tv_link(symbol)
                             atr_block = ""
@@ -603,7 +600,7 @@ def analyst_loop():
                             send_msg(msg)
                             sent_signals[s_key] = time.time()
                             bot_status["signals_sent"] += 1
-                            logging.info(f"ШОРТ: {symbol} score={s_score} threshold={threshold} | {s_details}")
+                            logging.info(f"ШОРТ: {symbol} score={s_score} thr={threshold} | {s_details}")
 
                     time.sleep(0.15)
 
@@ -620,7 +617,7 @@ def analyst_loop():
 
             bot_status["iterations"]    += 1
             bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
-            logging.info(f"Итерация завершена. Кэш: {len(sent_signals)}. BTC vol: {ctx['btc_vol']:.2f}%")
+            logging.info(f"Итерация завершена. Символов: {len(symbols)}. Кэш: {len(sent_signals)}. BTC vol: {ctx['btc_vol']:.2f}%")
             time.sleep(300)
 
         except ccxt.NetworkError as e:
@@ -647,11 +644,9 @@ def health():
 
 
 # ─────────────────────────────────────────────
-# KEEPALIVE
-# Render Free засыпает если нет ВНЕШНИХ запросов.
-# Задай env переменную RENDER_EXTERNAL_URL =
+# KEEPALIVE — не даём Render Free засыпать
+# Добавь env переменную RENDER_EXTERNAL_URL =
 # https://твой-сервис.onrender.com
-# Render выставляет её автоматически в новых сервисах.
 # ─────────────────────────────────────────────
 def keepalive_loop():
     time.sleep(30)
@@ -671,6 +666,9 @@ def keepalive_loop():
         time.sleep(240)
 
 
+# ─────────────────────────────────────────────
+# WATCHDOG — перезапускает analyst_loop при падении
+# ─────────────────────────────────────────────
 def watchdog():
     time.sleep(60)
     while True:
