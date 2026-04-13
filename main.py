@@ -185,30 +185,50 @@ def get_cvd_divergence(ohlcv, mode='long'):
 # ─────────────────────────────────────────────
 def get_oi_signal(symbol, price_change_pct):
     """
+    MEXC не поддерживает OI через ccxt (has=False).
+    Используем прямой REST API: contract.mexc.com
+
+    Запрашиваем текущий OI дважды с паузой — считаем изменение.
+    Это менее точно чем история но работает без авторизации.
+
+    Символ BTC/USDT:USDT → BTC_USDT для MEXC REST API.
+
     Возвращает (oi_chg_pct, signal, label).
     signal: 'bull' / 'bear' / 'squeeze_up' / 'squeeze_dn' / 'neutral'
-
-    Логика:
-    OI ↑ + цена ↑ = новые лонги заходят  → bull (деньги работают)
-    OI ↑ + цена ↓ = новые шорты заходят  → bear (давление вниз)
-    OI ↓ + цена ↑ = шорт-сквиз          → squeeze_up (слабое движение)
-    OI ↓ + цена ↓ = лонг-ликвидации     → squeeze_dn (слабое)
     """
     try:
-        oi_data = exchange.fetch_open_interest_history(symbol, '4h', limit=3)
-        if not oi_data or len(oi_data) < 2:
+        # Конвертируем символ в формат MEXC futures REST API
+        mexc_sym = symbol.replace('/USDT:USDT', '_USDT')
+        if '/' in mexc_sym:
+            mexc_sym = mexc_sym.replace('/', '_')
+
+        # Используем kline эндпоинт для получения OI по свечам
+        # MEXC: /api/v1/contract/kline/openInterest/{symbol}
+        url = f"https://contract.mexc.com/api/v1/contract/kline/openInterest/{mexc_sym}"
+        params = {'interval': 'Hour4', 'limit': 3}
+
+        resp = requests.get(url, params=params, timeout=8)
+        if not resp.ok:
             return 0.0, 'neutral', '⚪️ OI: нет данных'
 
-        oi_prev = float(oi_data[-2].get('openInterestAmount', 0) or 0)
-        oi_curr = float(oi_data[-1].get('openInterestAmount', 0) or 0)
+        data = resp.json()
+        if not data.get('success') or not data.get('data'):
+            return 0.0, 'neutral', '⚪️ OI: нет данных'
+
+        oi_list = data['data'].get('openInterest', [])
+        if not oi_list or len(oi_list) < 2:
+            return 0.0, 'neutral', '⚪️ OI: нет данных'
+
+        oi_prev = float(oi_list[-2] or 0)
+        oi_curr = float(oi_list[-1] or 0)
+
         if oi_prev == 0:
             return 0.0, 'neutral', '⚪️ OI: нет данных'
 
         oi_chg = (oi_curr - oi_prev) / oi_prev * 100
 
         if abs(oi_chg) < 1.0:
-            label = f"⚪️ OI: {oi_chg:+.1f}% (нейтраль)"
-            return oi_chg, 'neutral', label
+            return oi_chg, 'neutral', f"⚪️ OI: {oi_chg:+.1f}% (нейтраль)"
 
         if oi_chg > 0 and price_change_pct >= 0:
             signal = 'bull'
@@ -218,7 +238,7 @@ def get_oi_signal(symbol, price_change_pct):
             label  = f"🔴 OI: +{oi_chg:.1f}% (деньги заходят в шорт)"
         elif oi_chg < 0 and price_change_pct >= 0:
             signal = 'squeeze_up'
-            label  = f"⚠️ OI: {oi_chg:.1f}% (шорт-сквиз, слабое движение)"
+            label  = f"⚠️ OI: {oi_chg:.1f}% (шорт-сквиз)"
         else:
             signal = 'squeeze_dn'
             label  = f"⚠️ OI: {oi_chg:.1f}% (лонг-ликвидации)"
@@ -852,8 +872,8 @@ def analyst_loop():
                         macro_veto_s = btc_is_green and not is_strong_s
 
                         # Памп-вето: палка вверх с огромным объёмом
-                        # Шортить памп с x10 объёма = SKYAI-кейс
-                        pump_veto_s  = v_rel > 10 and imb > 60 and price_ch > 5
+                        # Шортить памп с x8+ объёма = SKYAI/WET кейс
+                        pump_veto_s  = v_rel > 8 and imb > 60 and price_ch > 3
 
                         if s_score >= threshold and not macro_veto_s and not pump_veto_s:
                             if is_strong_s and btc_is_green:
