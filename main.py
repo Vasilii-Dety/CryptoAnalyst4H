@@ -42,6 +42,11 @@ bot_status = {
     "signals_sent":   0,
 }
 
+# Кэш OI: хранит предыдущее holdVol для каждого символа
+# Обновляется каждую итерацию (каждые 5 минут)
+# После 2+ итераций начнёт показывать изменение OI
+oi_cache: dict = {}
+
 
 def build_tv_link(symbol: str) -> str:
     tv_sym = symbol.replace('/', '').replace(':USDT', '.P')
@@ -183,51 +188,40 @@ def get_cvd_divergence(ohlcv, mode='long'):
 # ─────────────────────────────────────────────
 # ОТКРЫТЫЙ ИНТЕРЕС (OI)
 # ─────────────────────────────────────────────
-def get_oi_signal(symbol, price_change_pct):
+def get_oi_data_from_ticker(symbol, tickers, price_change_pct):
     """
-    MEXC не поддерживает OI через ccxt (has=False).
-    Используем прямой REST API: contract.mexc.com
+    OI берём из уже загруженного fetch_tickers().
+    MEXC возвращает holdVol (открытый интерес в контрактах)
+    в поле info тикера — это бесплатно, без доп. запросов.
 
-    Запрашиваем текущий OI дважды с паузой — считаем изменение.
-    Это менее точно чем история но работает без авторизации.
-
-    Символ BTC/USDT:USDT → BTC_USDT для MEXC REST API.
+    Для сравнения динамики используем предыдущее значение
+    из кэша oi_cache (глобальный словарь).
 
     Возвращает (oi_chg_pct, signal, label).
-    signal: 'bull' / 'bear' / 'squeeze_up' / 'squeeze_dn' / 'neutral'
     """
     try:
-        # Конвертируем символ в формат MEXC futures REST API
-        mexc_sym = symbol.replace('/USDT:USDT', '_USDT')
-        if '/' in mexc_sym:
-            mexc_sym = mexc_sym.replace('/', '_')
-
-        # Используем kline эндпоинт для получения OI по свечам
-        # MEXC: /api/v1/contract/kline/openInterest/{symbol}
-        url = f"https://contract.mexc.com/api/v1/contract/kline/openInterest/{mexc_sym}"
-        params = {'interval': 'Hour4', 'limit': 3}
-
-        resp = requests.get(url, params=params, timeout=8)
-        if not resp.ok:
+        ticker = tickers.get(symbol)
+        if not ticker:
             return 0.0, 'neutral', '⚪️ OI: нет данных'
 
-        data = resp.json()
-        if not data.get('success') or not data.get('data'):
+        info     = ticker.get('info', {})
+        hold_vol = float(info.get('holdVol', 0) or 0)
+
+        if hold_vol == 0:
             return 0.0, 'neutral', '⚪️ OI: нет данных'
 
-        oi_list = data['data'].get('openInterest', [])
-        if not oi_list or len(oi_list) < 2:
-            return 0.0, 'neutral', '⚪️ OI: нет данных'
+        # Сравниваем с предыдущим значением из кэша
+        prev_vol = oi_cache.get(symbol, 0)
+        oi_cache[symbol] = hold_vol  # обновляем кэш
 
-        oi_prev = float(oi_list[-2] or 0)
-        oi_curr = float(oi_list[-1] or 0)
+        if prev_vol == 0:
+            # Первый раз — нет истории, просто показываем значение
+            label = f"⚪️ OI: {hold_vol:.0f} (первое измерение)"
+            return 0.0, 'neutral', label
 
-        if oi_prev == 0:
-            return 0.0, 'neutral', '⚪️ OI: нет данных'
+        oi_chg = (hold_vol - prev_vol) / prev_vol * 100
 
-        oi_chg = (oi_curr - oi_prev) / oi_prev * 100
-
-        if abs(oi_chg) < 1.0:
+        if abs(oi_chg) < 0.5:
             return oi_chg, 'neutral', f"⚪️ OI: {oi_chg:+.1f}% (нейтраль)"
 
         if oi_chg > 0 and price_change_pct >= 0:
@@ -678,9 +672,8 @@ def analyst_loop():
                     fr_label  = '⚪️ Фандинг: нет данных'
 
                     if has_any_signal:
-                        oi_chg, oi_signal, oi_label = get_oi_signal(symbol, price_ch)
+                        oi_chg, oi_signal, oi_label = get_oi_data_from_ticker(symbol, tickers, price_ch)
                         fr_val, fr_signal, fr_label  = get_funding_signal(symbol)
-                        time.sleep(0.1)
 
                     wl_badge = " | ⭐️ WL" if is_wl else ""
 
