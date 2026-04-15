@@ -221,7 +221,8 @@ def get_oi_data_from_ticker(symbol, tickers, price_change_pct):
 
         oi_chg = (hold_vol - prev_vol) / prev_vol * 100
 
-        if abs(oi_chg) < 0.5:
+        # Порог нейтрали 2% — изменение меньше это шум (5-минутные колебания)
+        if abs(oi_chg) < 2.0:
             return oi_chg, 'neutral', f"⚪️ OI: {oi_chg:+.1f}% (нейтраль)"
 
         if oi_chg > 0 and price_change_pct >= 0:
@@ -759,10 +760,14 @@ def analyst_loop():
                         macro_veto_l = btc_is_red and not is_strong_l
 
                         # Дамп-вето: палка вниз с огромным объёмом
-                        # При таком движении лонг преждевременен
                         dump_veto_l  = v_rel > 10 and imb < -60 and price_ch < -5
 
-                        if l_score >= threshold and not macro_veto_l and not dump_veto_l:
+                        # Перекупленность-вето: RSI/MFI экстремально высокие
+                        # Лонг при RSI>75 и MFI>80 = вход на вершине (кейс RIF лонг)
+                        # Исключение: M13 Reversal — там перекупленность может быть нормой
+                        overbought_veto_l = (rsi > 75 and mfi > 80) and not m13_l
+
+                        if l_score >= threshold and not macro_veto_l and not dump_veto_l and not overbought_veto_l:
                             if is_strong_l and btc_is_red:
                                 status = "⚡️ СИЛЬНЕЕ РЫНКА"
                             else:
@@ -865,10 +870,18 @@ def analyst_loop():
                         macro_veto_s = btc_is_green and not is_strong_s
 
                         # Памп-вето: палка вверх с огромным объёмом
-                        # Шортить памп с x8+ объёма = SKYAI/WET кейс
                         pump_veto_s  = v_rel > 8 and imb > 60 and price_ch > 3
 
-                        if s_score >= threshold and not macro_veto_s and not pump_veto_s:
+                        # Противоречие-вето: последняя свеча бычья но шортим
+                        # imb > 30 = покупатели победили в последней свече
+                        # Исключение: OI явно медвежий или есть M13
+                        contradiction_veto_s = imb > 30 and oi_signal not in ('bear',) and not m13_s
+
+                        # Перепроданность-вето: RSI/MFI экстремально низкие
+                        # Шорт при RSI<25 = шортим уже на дне
+                        oversold_veto_s = (rsi < 25 and mfi < 20) and not m13_s
+
+                        if s_score >= threshold and not macro_veto_s and not pump_veto_s and not contradiction_veto_s and not oversold_veto_s:
                             if is_strong_s and btc_is_green:
                                 status = "⚡️ ПРОТИВ РЫНКА"
                             else:
