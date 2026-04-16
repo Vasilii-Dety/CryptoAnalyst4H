@@ -626,6 +626,26 @@ def analyst_loop():
                     price_ch = ((closed[-1][4] - closed[-2][4]) / closed[-2][4] * 100) \
                                if len(closed) >= 2 else 0.0
 
+                    # ── Анализ последних 3 свечей — тренд перед сигналом ──
+                    # Если 3 свечи подряд шли в одну сторону с большими телами
+                    # текущая свеча ещё не разворот — это продолжение тренда
+                    prev_changes = []
+                    for k in range(1, 4):
+                        if len(closed) > k + 1:
+                            c_k = closed[-(k+1)]
+                            ch_k = (c_k[4] - c_k[1]) / c_k[1] * 100  # close vs open
+                            prev_changes.append(ch_k)
+
+                    # Тренд последних 3 свечей
+                    bullish_run = len(prev_changes) >= 3 and all(c > 1.0 for c in prev_changes)
+                    bearish_run = len(prev_changes) >= 3 and all(c < -1.0 for c in prev_changes)
+
+                    # Свечной фильтр: текущая свеча уже большая палка
+                    # Лонг после бычьей палки >4% = поздний вход, блокируем
+                    # Шорт после медвежьей палки >4% = поздний вход, блокируем
+                    late_long_candle  = price_ch > 4.0   # текущая свеча уже улетела вверх
+                    late_short_candle = price_ch < -4.0  # текущая свеча уже улетела вниз
+
                     # ── CVD уровень и дивергенция ──
                     cvd_level, cvd_total = calc_cvd_level(closed)
                     cvd_div_l = get_cvd_divergence(closed, 'long')
@@ -763,11 +783,23 @@ def analyst_loop():
                         dump_veto_l  = v_rel > 10 and imb < -60 and price_ch < -5
 
                         # Перекупленность-вето: RSI/MFI экстремально высокие
-                        # Лонг при RSI>75 и MFI>80 = вход на вершине (кейс RIF лонг)
-                        # Исключение: M13 Reversal — там перекупленность может быть нормой
                         overbought_veto_l = (rsi > 75 and mfi > 80) and not m13_l
 
-                        if l_score >= threshold and not macro_veto_l and not dump_veto_l and not overbought_veto_l:
+                        # Свечной фильтр: лонг после большой бычьей палки = поздний вход
+                        # Исключение: M13 (разворот) или очень сильный OI
+                        late_candle_veto_l = late_long_candle and not m13_l and oi_signal != 'bull'
+
+                        # Тренд-фильтр: 3 бычьи свечи подряд = истощение, не начало
+                        # Лонг в конце бычьего забега без OI подтверждения — опасно
+                        trend_veto_l = bullish_run and oi_signal not in ('bull',) and not (m9_l or m13_l)
+
+                        # OI-ворота: без бычьего OI скор ограничен 4
+                        # Это главное изменение — OI теперь необходим для сильного сигнала
+                        if oi_signal not in ('bull', 'squeeze_dn') and not (m13_l or cvd_div_l):
+                            l_score = min(l_score, 4)
+
+                        if l_score >= threshold and not macro_veto_l and not dump_veto_l \
+                                and not overbought_veto_l and not late_candle_veto_l and not trend_veto_l:
                             if is_strong_l and btc_is_red:
                                 status = "⚡️ СИЛЬНЕЕ РЫНКА"
                             else:
@@ -873,15 +905,24 @@ def analyst_loop():
                         pump_veto_s  = v_rel > 8 and imb > 60 and price_ch > 3
 
                         # Противоречие-вето: последняя свеча бычья но шортим
-                        # imb > 30 = покупатели победили в последней свече
-                        # Исключение: OI явно медвежий или есть M13
                         contradiction_veto_s = imb > 30 and oi_signal not in ('bear',) and not m13_s
 
                         # Перепроданность-вето: RSI/MFI экстремально низкие
-                        # Шорт при RSI<25 = шортим уже на дне
                         oversold_veto_s = (rsi < 25 and mfi < 20) and not m13_s
 
-                        if s_score >= threshold and not macro_veto_s and not pump_veto_s and not contradiction_veto_s and not oversold_veto_s:
+                        # Свечной фильтр: шорт после большой медвежьей палки = поздний вход
+                        late_candle_veto_s = late_short_candle and not m13_s and oi_signal != 'bear'
+
+                        # Тренд-фильтр: 3 медвежьи свечи подряд без OI = опасно шортить дальше
+                        trend_veto_s = bearish_run and oi_signal not in ('bear',) and not (m9_s or m13_s)
+
+                        # OI-ворота: без медвежьего OI скор ограничен 4
+                        if oi_signal not in ('bear', 'squeeze_up') and not (m13_s or cvd_div_s):
+                            s_score = min(s_score, 4)
+
+                        if s_score >= threshold and not macro_veto_s and not pump_veto_s \
+                                and not contradiction_veto_s and not oversold_veto_s \
+                                and not late_candle_veto_s and not trend_veto_s:
                             if is_strong_s and btc_is_green:
                                 status = "⚡️ ПРОТИВ РЫНКА"
                             else:
