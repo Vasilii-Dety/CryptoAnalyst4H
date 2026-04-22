@@ -38,15 +38,15 @@ WATCHLIST = [
 # ПОРОГИ ФИЛЬТРОВ
 # ─────────────────────────────────────────────
 MIN_VOLUME_SIGNAL    = 5_000_000   # $5M для СИГНАЛ
-MIN_VOLUME_ATTENTION = 2_000_000   # $2M для ВНИМАНИЕ
+MIN_VOLUME_ATTENTION = 1_000_000   # $1M для ВНИМАНИЕ
 MIN_RR_SIGNAL        = 3.0         # R/R для СИГНАЛ
 MIN_RR_ATTENTION     = 2.0         # R/R для ВНИМАНИЕ
 MIN_TARGET_PCT_SIGNAL    = 5.0     # цель минимум 5% для СИГНАЛ
-MIN_TARGET_PCT_ATTENTION = 3.0     # цель минимум 3% для ВНИМАНИЕ
+MIN_TARGET_PCT_ATTENTION = 2.0     # цель минимум 2% для ВНИМАНИЕ
 MAX_STOP_PCT         = 3.0         # стоп максимум 3%
 SCORE_SIGNAL         = 7           # порог СИГНАЛ
 SCORE_ATTENTION      = 4           # порог ВНИМАНИЕ
-SWING_ATTENTION_PCT  = 2.0         # % от Swing High/Low для ВНИМАНИЕ
+SWING_ATTENTION_PCT  = 3.0         # % от Swing High/Low для ВНИМАНИЕ
 
 bot_status = {
     "started_at":     datetime.now().isoformat(),
@@ -300,6 +300,342 @@ def calculate_swing_hilo(ohlcv, swing_bars=34):
     near_sw_high = 0 <= sw_high_pct <= SWING_ATTENTION_PCT
 
     return sw_low_pct, sw_high_pct, near_sw_low, near_sw_high, last_sw_low, last_sw_high
+
+
+# ─────────────────────────────────────────────
+# ЭЛЛИОТТ ВОЛНЫ + ФИБОНАЧЧИ
+#
+# Алгоритм:
+# 1. Собираем все свинг-точки (HILO с lookback=10)
+# 2. Определяем структуру: бычья / медвежья / боковая
+# 3. Считаем Фибо откат текущей коррекции
+# 4. Определяем предположительный номер волны
+# 5. Считаем цели расширения (1.618, 2.618)
+# 6. Проверяем BOS (Break of Structure)
+#
+# Возвращает словарь со всей информацией
+# ─────────────────────────────────────────────
+def analyze_elliott(ohlcv, swing_bars=10):
+    """
+    Анализ волн Эллиотта на 4H.
+
+    Возвращает dict:
+      structure:     'bullish' / 'bearish' / 'neutral'
+      wave_number:   1-5 или 'A'/'B'/'C' или None
+      wave_label:    читаемое описание
+      fib_retracement: процент отката (0-100)
+      fib_level:     ближайший уровень Фибо (0.382/0.5/0.618)
+      fib_on_level:  True если цена на уровне Фибо ±1%
+      wave1_low:     начало волны 1
+      wave1_high:    конец волны 1 (= начало волны 2)
+      fib_382/500/618: уровни поддержки/сопротивления
+      ext_1618:      цель волны 3 (1.618 расширение)
+      ext_2618:      цель волны 3 (2.618 расширение)
+      bos_bull:      True = пробой предыдущего хая (бычий BOS)
+      bos_bear:      True = пробой предыдущего лоя (медвежий BOS)
+      score_long:    бонус к скору лонга (0-4)
+      score_short:   бонус к скору шорта (0-4)
+      details_long:  список строк для алерта лонг
+      details_short: список строк для алерта шорт
+      alert_block:   готовый блок текста для алерта
+    """
+    result = {
+        'structure': 'neutral', 'wave_number': None, 'wave_label': '⚪️ Нет данных',
+        'fib_retracement': 0.0, 'fib_level': None, 'fib_on_level': False,
+        'wave1_low': None, 'wave1_high': None,
+        'fib_382': None, 'fib_500': None, 'fib_618': None,
+        'ext_1618': None, 'ext_2618': None,
+        'bos_bull': False, 'bos_bear': False,
+        'score_long': 0, 'score_short': 0,
+        'details_long': [], 'details_short': [],
+        'alert_block': ''
+    }
+
+    if len(ohlcv) < swing_bars * 4 + 1:
+        return result
+
+    highs  = [c[2] for c in ohlcv]
+    lows   = [c[3] for c in ohlcv]
+    closes = [c[4] for c in ohlcv]
+    n      = len(ohlcv)
+
+    # ── Собираем свинг-точки ──────────────────
+    swing_lows  = []  # (index, price)
+    swing_highs = []
+
+    for i in range(swing_bars, n - swing_bars):
+        if lows[i] == min(lows[i - swing_bars:i + swing_bars + 1]):
+            swing_lows.append((i, lows[i]))
+        if highs[i] == max(highs[i - swing_bars:i + swing_bars + 1]):
+            swing_highs.append((i, highs[i]))
+
+    if len(swing_lows) < 2 or len(swing_highs) < 2:
+        return result
+
+    # Последние 3 свинга каждого типа
+    last_lows  = swing_lows[-3:]
+    last_highs = swing_highs[-3:]
+
+    current = closes[-1]
+
+    # ── Определяем структуру ─────────────────
+    # Бычья: каждый следующий лой выше предыдущего
+    #        каждый следующий хай выше предыдущего
+    bull_lows  = all(last_lows[i][1]  < last_lows[i+1][1]  for i in range(len(last_lows)-1))
+    bull_highs = all(last_highs[i][1] < last_highs[i+1][1] for i in range(len(last_highs)-1))
+    bear_lows  = all(last_lows[i][1]  > last_lows[i+1][1]  for i in range(len(last_lows)-1))
+    bear_highs = all(last_highs[i][1] > last_highs[i+1][1] for i in range(len(last_highs)-1))
+
+    if bull_lows and bull_highs:
+        result['structure'] = 'bullish'
+    elif bear_lows and bear_highs:
+        result['structure'] = 'bearish'
+    elif bull_lows and not bull_highs:
+        result['structure'] = 'bullish'  # лои растут = основной сигнал
+    elif bear_highs and not bear_lows:
+        result['structure'] = 'bearish'
+    else:
+        result['structure'] = 'neutral'
+
+    # ── BOS (Break of Structure) ──────────────
+    # Бычий BOS: текущая цена пробила предпоследний swing high
+    if len(swing_highs) >= 2:
+        prev_high = swing_highs[-2][1]
+        result['bos_bull'] = current > prev_high
+
+    # Медвежий BOS: текущая цена пробила предпоследний swing low
+    if len(swing_lows) >= 2:
+        prev_low = swing_lows[-2][1]
+        result['bos_bear'] = current < prev_low
+
+    # ── Фибоначчи расчёт ─────────────────────
+    # Берём последний значимый импульс:
+    # для бычьей структуры: от последнего swing low до последнего swing high
+    # для медвежьей: от последнего swing high до последнего swing low
+
+    if result['structure'] == 'bullish':
+        # Последний импульс вверх
+        w1_low  = swing_lows[-2][1]   # начало импульса (волна 1 старт)
+        w1_high = swing_highs[-1][1]  # конец импульса (волна 1 финиш)
+        impulse = w1_high - w1_low
+
+        if impulse <= 0:
+            return result
+
+        result['wave1_low']  = w1_low
+        result['wave1_high'] = w1_high
+
+        # Уровни Фибо (поддержки при коррекции)
+        result['fib_382'] = w1_high - impulse * 0.382
+        result['fib_500'] = w1_high - impulse * 0.500
+        result['fib_618'] = w1_high - impulse * 0.618
+
+        # Цели расширения волны 3
+        result['ext_1618'] = w1_low + impulse * 1.618
+        result['ext_2618'] = w1_low + impulse * 2.618
+
+        # Текущий откат от хая
+        if current < w1_high:
+            retrace = (w1_high - current) / impulse * 100
+            result['fib_retracement'] = retrace
+
+            # Определяем на каком уровне Фибо цена
+            tolerance = 0.015  # ±1.5% от уровня
+            for lvl_name, lvl_val in [('61.8%', result['fib_618']),
+                                       ('50.0%', result['fib_500']),
+                                       ('38.2%', result['fib_382'])]:
+                if lvl_val and abs(current - lvl_val) / lvl_val <= tolerance:
+                    result['fib_level']    = lvl_name
+                    result['fib_on_level'] = True
+                    break
+
+            # ── Определяем номер волны ───────
+            if retrace <= 38.2:
+                # Небольшой откат — возможно волна 4
+                result['wave_number'] = 4
+                result['wave_label']  = '〽️ Волна 4 (откат, ждём 5)'
+            elif 38.2 < retrace <= 61.8:
+                # Классический откат волны 2
+                result['wave_number'] = 2
+                result['wave_label']  = '〽️ Волна 2 → ожидается Волна 3 ⚡️'
+            elif retrace > 61.8:
+                # Глубокий откат — или волна 2 расширенная
+                # или смена тренда
+                if retrace <= 78.6:
+                    result['wave_number'] = 2
+                    result['wave_label']  = '〽️ Волна 2 глубокая (78.6%)'
+                else:
+                    result['wave_number'] = None
+                    result['wave_label']  = '⚠️ Возможная смена тренда'
+        else:
+            # Цена выше хая = импульс продолжается
+            # Проверяем: это волна 3?
+            ext_pct = (current - w1_low) / impulse * 100
+            if 100 < ext_pct <= 162:
+                result['wave_number'] = 3
+                result['wave_label']  = '⚡️ Волна 3 (активная)'
+            elif ext_pct > 162:
+                result['wave_number'] = 3
+                result['wave_label']  = '⚡️ Волна 3 расширенная'
+            else:
+                result['wave_number'] = 1
+                result['wave_label']  = '〽️ Волна 1 (начало)'
+
+    elif result['structure'] == 'bearish':
+        # Последний импульс вниз
+        w1_high = swing_highs[-2][1]
+        w1_low  = swing_lows[-1][1]
+        impulse = w1_high - w1_low
+
+        if impulse <= 0:
+            return result
+
+        result['wave1_low']  = w1_low
+        result['wave1_high'] = w1_high
+
+        # Фибо для медвежьего (сопротивления при отскоке)
+        result['fib_382'] = w1_low + impulse * 0.382
+        result['fib_500'] = w1_low + impulse * 0.500
+        result['fib_618'] = w1_low + impulse * 0.618
+
+        # Цели расширения вниз
+        result['ext_1618'] = w1_high - impulse * 1.618
+        result['ext_2618'] = w1_high - impulse * 2.618
+
+        if current > w1_low:
+            retrace = (current - w1_low) / impulse * 100
+            result['fib_retracement'] = retrace
+
+            tolerance = 0.015
+            for lvl_name, lvl_val in [('61.8%', result['fib_618']),
+                                       ('50.0%', result['fib_500']),
+                                       ('38.2%', result['fib_382'])]:
+                if lvl_val and abs(current - lvl_val) / lvl_val <= tolerance:
+                    result['fib_level']    = lvl_name
+                    result['fib_on_level'] = True
+                    break
+
+            if retrace <= 38.2:
+                result['wave_number'] = 4
+                result['wave_label']  = '〽️ Волна 4 (отскок, ждём 5↓)'
+            elif 38.2 < retrace <= 61.8:
+                result['wave_number'] = 2
+                result['wave_label']  = '〽️ Волна 2↓ → ожидается Волна 3↓ ⚡️'
+            elif retrace > 61.8:
+                if retrace <= 78.6:
+                    result['wave_number'] = 2
+                    result['wave_label']  = '〽️ Волна 2↓ глубокая (78.6%)'
+                else:
+                    result['wave_number'] = None
+                    result['wave_label']  = '⚠️ Возможный разворот вверх'
+        else:
+            ext_pct = (w1_high - current) / impulse * 100
+            if 100 < ext_pct <= 162:
+                result['wave_number'] = 3
+                result['wave_label']  = '⚡️ Волна 3↓ (активная)'
+            elif ext_pct > 162:
+                result['wave_number'] = 3
+                result['wave_label']  = '⚡️ Волна 3↓ расширенная'
+            else:
+                result['wave_number'] = 1
+                result['wave_label']  = '〽️ Волна 1↓ (начало)'
+
+    # ── Скоринг и детали ─────────────────────
+    sc_l = 0; sc_s = 0; det_l = []; det_s = []
+
+    # ЛОНГ бонусы
+    if result['structure'] == 'bullish':
+        if result['wave_number'] == 2 and result['fib_on_level']:
+            # Лучший вход: волна 2 на Фибо = начало волны 3
+            sc_l += 3
+            det_l.append(f"⚡️ W2→W3 Фибо {result['fib_level']}")
+        elif result['wave_number'] == 2:
+            sc_l += 2
+            det_l.append("〽️ Волна 2 (откат)")
+        elif result['wave_number'] == 4 and result['fib_on_level']:
+            sc_l += 2
+            det_l.append(f"〽️ W4 Фибо {result['fib_level']}")
+        elif result['wave_number'] == 4:
+            sc_l += 1
+            det_l.append("〽️ Волна 4 (откат)")
+        if result['bos_bull']:
+            sc_l += 1
+            det_l.append("💥 BOS пробой")
+
+    # ШОРТ бонусы
+    if result['structure'] == 'bearish':
+        if result['wave_number'] == 2 and result['fib_on_level']:
+            sc_s += 3
+            det_s.append(f"⚡️ W2↓→W3↓ Фибо {result['fib_level']}")
+        elif result['wave_number'] == 2:
+            sc_s += 2
+            det_s.append("〽️ Волна 2↓ (отскок)")
+        elif result['wave_number'] == 4 and result['fib_on_level']:
+            sc_s += 2
+            det_s.append(f"〽️ W4↓ Фибо {result['fib_level']}")
+        elif result['wave_number'] == 4:
+            sc_s += 1
+            det_s.append("〽️ Волна 4↓ (отскок)")
+        if result['bos_bear']:
+            sc_s += 1
+            det_s.append("💥 BOS пробой вниз")
+
+    result['score_long']   = sc_l
+    result['score_short']  = sc_s
+    result['details_long'] = det_l
+    result['details_short']= det_s
+
+    # ── Блок для алерта ──────────────────────
+    lines = []
+    lines.append(f"〽️ Эллиотт: <b>{result['wave_label']}</b>")
+
+    if result['wave1_low'] and result['wave1_high']:
+        imp = result['wave1_high'] - result['wave1_low']
+        imp_pct = imp / result['wave1_low'] * 100
+        lines.append(
+            f"   Импульс: {result['wave1_low']:.4g} → "
+            f"{result['wave1_high']:.4g} (+{imp_pct:.1f}%)"
+        )
+
+    if result['fib_retracement'] > 0:
+        fib_str = f"Откат: {result['fib_retracement']:.1f}%"
+        if result['fib_on_level']:
+            fib_str += f" 📐 на уровне {result['fib_level']} ✅"
+        lines.append(f"   {fib_str}")
+
+    if result['structure'] == 'bullish' and result['fib_382']:
+        lines.append(
+            f"📐 Фибо: 38.2%={result['fib_382']:.4g} | "
+            f"50%={result['fib_500']:.4g} | "
+            f"61.8%={result['fib_618']:.4g}"
+        )
+        if result['ext_1618']:
+            w1_low = result['wave1_low']
+            lines.append(
+                f"🎯 Цели W3: ×1.618={result['ext_1618']:.4g} "
+                f"(+{(result['ext_1618']/result['wave1_high']-1)*100:.1f}%) | "
+                f"×2.618={result['ext_2618']:.4g} "
+                f"(+{(result['ext_2618']/result['wave1_high']-1)*100:.1f}%)"
+            )
+    elif result['structure'] == 'bearish' and result['fib_382']:
+        lines.append(
+            f"📐 Фибо: 38.2%={result['fib_382']:.4g} | "
+            f"50%={result['fib_500']:.4g} | "
+            f"61.8%={result['fib_618']:.4g}"
+        )
+        if result['ext_1618']:
+            lines.append(
+                f"🎯 Цели W3↓: ×1.618={result['ext_1618']:.4g} "
+                f"(-{(1-result['ext_1618']/result['wave1_low'])*100:.1f}%) | "
+                f"×2.618={result['ext_2618']:.4g} "
+                f"(-{(1-result['ext_2618']/result['wave1_low'])*100:.1f}%)"
+            )
+
+    if result['bos_bull']: lines.append("💥 BOS: пробой предыдущего хая")
+    if result['bos_bear']: lines.append("💥 BOS: пробой предыдущего лоя")
+
+    result['alert_block'] = '\n'.join(lines)
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -898,11 +1234,15 @@ def analyst_loop():
                         wyckoff_short_ok = True; wyckoff_long_ok  = False
                         wyckoff_label    = f"🔝 После памп +{big_move_pct:.0f}%"
 
+                    # Эллиотт волны
+                    ew = analyze_elliott(closed, swing_bars=10)
+
                     # OI и фандинг
                     has_any = (cvd_div_l or cvd_div_s or hammer_l or hammer_s or
                                m9_l or m9_s or m13_l or m13_s or
                                rsi_div_bull or rsi_div_bear or vol_score >= 2 or
-                               near_sw_low or near_sw_high or bb_signal != 'neutral')
+                               near_sw_low or near_sw_high or bb_signal != 'neutral' or
+                               ew['score_long'] >= 2 or ew['score_short'] >= 2)
 
                     oi_chg=0.0; oi_signal='neutral'; oi_label='⚪️ OI: нет данных'
                     fr_val=0.0; fr_signal='neutral'; fr_label='⚪️ Фандинг: нет данных'
@@ -1005,6 +1345,12 @@ def analyst_loop():
                         if mode == 'short' and rsi > 70:  score += 1; details.append(f"📈 RSI {rsi:.0f}")
                         if mode == 'short' and mfi > 80:  score += 1; details.append(f"💰 MFI {mfi:.0f}")
 
+                        # Эллиотт бонус
+                        if mode == 'long'  and ew['score_long'] > 0:
+                            score += ew['score_long']; details.extend(ew['details_long'])
+                        if mode == 'short' and ew['score_short'] > 0:
+                            score += ew['score_short']; details.extend(ew['details_short'])
+
                         return max(score, 0), details
 
                     # ══════════════════════════════════════════════════
@@ -1015,7 +1361,6 @@ def analyst_loop():
                     if (la_key not in sent_attention
                             and near_sw_low
                             and long_gate
-                            and wyckoff_phase != 'ranging'
                             and vol_24h >= MIN_VOLUME_ATTENTION):
 
                         a_score, a_details = calc_score('long')
@@ -1033,6 +1378,7 @@ def analyst_loop():
                                 f"───────────────────\n"
                                 f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
                                 f"{ssma_label}\n"
+                                f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
                                 f"{vol_detail}\n"
@@ -1059,7 +1405,6 @@ def analyst_loop():
                     if (sa_key not in sent_attention
                             and near_sw_high
                             and short_gate
-                            and wyckoff_phase != 'ranging'
                             and vol_24h >= MIN_VOLUME_ATTENTION):
 
                         a_score, a_details = calc_score('short')
@@ -1077,6 +1422,7 @@ def analyst_loop():
                                 f"───────────────────\n"
                                 f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
                                 f"{ssma_label}\n"
+                                f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
                                 f"{vol_detail}\n"
@@ -1155,6 +1501,7 @@ def analyst_loop():
                                 f"{'📉 BB ATR: Перепродан' if bb_signal=='oversold' else ''}\n"
                                 f"{'🏔️ Swing Low: +' + f'{sw_low_pct:.1f}%' if near_sw_low else ''}\n"
                                 f"{ssma_label}\n"
+                                f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: <b>{rsi:.1f}</b> | MFI: <b>{mfi:.1f}</b>\n"
                                 f"⚖️ Дисбаланс: {'🟢' if imb>0 else '🔴'} <b>{abs(imb):.0f}%</b>\n"
@@ -1224,6 +1571,7 @@ def analyst_loop():
                                 f"{'📈 BB ATR: Перекуплен' if bb_signal=='overbought' else ''}\n"
                                 f"{'🏔️ Swing High: -' + f'{sw_high_pct:.1f}%' if near_sw_high else ''}\n"
                                 f"{ssma_label}\n"
+                                f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: <b>{rsi:.1f}</b> | MFI: <b>{mfi:.1f}</b>\n"
                                 f"⚖️ Дисбаланс: {'🔴' if imb>0 else '🟢'} <b>{abs(imb):.0f}%</b>\n"
