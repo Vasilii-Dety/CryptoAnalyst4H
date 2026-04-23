@@ -580,6 +580,27 @@ def analyze_elliott(ohlcv, swing_bars=10):
             sc_s += 1
             det_s.append("💥 BOS пробой вниз")
 
+    # ── Проверка слома структуры (ABC коррекция) ──
+    # Правило Эллиотта: если цена ушла ниже начала
+    # предполагаемой Волны 3 (= ниже wave1_low в бычьей структуре)
+    # → это не Волна 2, а ABC коррекция → блокируем лонг
+    if (result['structure'] == 'bullish'
+            and result['wave1_low'] is not None
+            and closes[-1] < result['wave1_low'] * 0.99):
+        result['wave_label']  = '⚠️ ABC коррекция (структура сломана)'
+        result['wave_number'] = None
+        sc_l = 0   # обнуляем лонг-скор — не входим
+        det_l = ['⚠️ ABC — ждём завершения коррекции']
+
+    # Аналогично для медвежьей: цена выше wave1_high = слом вниз
+    if (result['structure'] == 'bearish'
+            and result['wave1_high'] is not None
+            and closes[-1] > result['wave1_high'] * 1.01):
+        result['wave_label']  = '⚠️ ABC коррекция вверх (структура сломана)'
+        result['wave_number'] = None
+        sc_s = 0
+        det_s = ['⚠️ ABC — ждём завершения коррекции']
+
     result['score_long']   = sc_l
     result['score_short']  = sc_s
     result['details_long'] = det_l
@@ -1234,8 +1255,56 @@ def analyst_loop():
                         wyckoff_short_ok = True; wyckoff_long_ok  = False
                         wyckoff_label    = f"🔝 После памп +{big_move_pct:.0f}%"
 
-                    # Эллиотт волны
-                    ew = analyze_elliott(closed, swing_bars=10)
+                    # Эллиотт волны — два уровня
+                    # Локальный (10 баров) — текущая волновая структура
+                    # Глобальный (20 баров) — большой цикл
+                    ew       = analyze_elliott(closed, swing_bars=10)
+                    ew_big   = analyze_elliott(closed, swing_bars=20)
+
+                    # Глобальный контекст для алерта
+                    if ew_big['structure'] != 'neutral' and ew_big['wave_label'] != ew['wave_label']:
+                        ew_big_label = f"🌍 Глобально: <b>{ew_big['wave_label']}</b>"
+                        if ew_big['ext_1618']:
+                            ew_big_label += (
+                                f"\n   Цели W3 (глоб): "
+                                f"×1.618={ew_big['ext_1618']:.4g} | "
+                                f"×2.618={ew_big['ext_2618']:.4g}"
+                            )
+                    else:
+                        ew_big_label = ""
+
+                    # ── Анализ незакрытой свечи (инtrabar) ──
+                    # Смотрим на текущую незакрытую свечу
+                    # Если цена откатила >3% от внутридневного хая = потенциальный разворот вниз
+                    # Если цена выросла >3% от внутридневного лоя = потенциальный разворот вверх
+                    cur_candle    = ohlcv[-1]
+                    intrabar_high = cur_candle[2]
+                    intrabar_low  = cur_candle[3]
+                    intrabar_open = cur_candle[1]
+
+                    # Откат от внутридневного хая
+                    intrabar_pullback = (intrabar_high - current_price) / intrabar_high * 100                                         if intrabar_high > 0 else 0.0
+                    # Рост от внутридневного лоя
+                    intrabar_bounce   = (current_price - intrabar_low) / intrabar_low * 100                                         if intrabar_low > 0 else 0.0
+
+                    # Объём текущей свечи vs средний
+                    v_avg_cur = np.mean([x[5] for x in closed[-20:]]) if len(closed) >= 20 else 1.0
+                    cur_vol_rel = cur_candle[5] / v_avg_cur if v_avg_cur > 0 else 1.0
+
+                    # Разворот у хая: откат >2.5% + объём аномальный = ранний шорт-сигнал
+                    intrabar_top_reversal = (
+                        intrabar_pullback >= 2.5
+                        and cur_vol_rel >= 1.5
+                        and current_price < intrabar_high * 0.975
+                        and short_gate
+                    )
+                    # Разворот у лоя: отскок >2.5% + объём аномальный = ранний лонг-сигнал
+                    intrabar_bottom_reversal = (
+                        intrabar_bounce >= 2.5
+                        and cur_vol_rel >= 1.5
+                        and current_price > intrabar_low * 1.025
+                        and long_gate
+                    )
 
                     # OI и фандинг
                     has_any = (cvd_div_l or cvd_div_s or hammer_l or hammer_s or
@@ -1354,6 +1423,88 @@ def analyst_loop():
                         return max(score, 0), details
 
                     # ══════════════════════════════════════════════════
+                    # INTRABAR — РАННИЕ СИГНАЛЫ (незакрытая свеча)
+                    # ══════════════════════════════════════════════════
+                    ib_key_l = f"{symbol}_{candle_id}_ibl"
+                    ib_key_s = f"{symbol}_{candle_id}_ibs"
+
+                    # Intrabar ЛОНГ — отскок от лоя свечи
+                    if (ib_key_l not in sent_attention
+                            and intrabar_bottom_reversal
+                            and near_sw_low
+                            and vol_24h >= MIN_VOLUME_ATTENTION):
+                        ib_score, _ = calc_score('long')
+                        if ib_score >= SCORE_ATTENTION:
+                            msg = (
+                                f"⚡️ <b>РАННИЙ ЛОНГ 4H ({ib_score}/10){wl_badge}</b>\n"
+                                f"Монета: <b>{symbol}</b> | 🕯 Внутри свечи\n"
+                                f"Цена: <code>{current_price:.6g}</code>\n"
+                                f"Отскок от лоя: +{intrabar_bounce:.1f}%"
+                                f" | Объём: x{cur_vol_rel:.1f}\n"
+                                f"Swing Low: +{sw_low_pct:.1f}%\n"
+                                f"───────────────────\n"
+                                f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
+                                f"{ssma_label}\n"
+                                + (ew['alert_block'] + "\n" if ew['structure'] != 'neutral' else "")
+                                + (ew_big_label + "\n" if ew_big_label else "")
+                                + (
+                                f"───────────────────\n"
+                                f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
+                                f"{vol_detail}\n"
+                                f"{oi_label}\n"
+                                f"⚠️ Свеча не закрыта — ждите подтверждения\n"
+                                f"───────────────────\n"
+                                f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
+                                f"{build_tv_link(symbol)}"
+                                )
+                            )
+                            send_msg(msg)
+                            sent_attention[ib_key_l] = time.time()
+                            bot_status["attention_sent"] += 1
+                            logging.info(
+                                f"РАННИЙ ЛОНГ: {symbol} "
+                                f"bounce={intrabar_bounce:.1f}% vol=x{cur_vol_rel:.1f}"
+                            )
+
+                    # Intrabar ШОРТ — откат от хая свечи
+                    if (ib_key_s not in sent_attention
+                            and intrabar_top_reversal
+                            and near_sw_high
+                            and vol_24h >= MIN_VOLUME_ATTENTION):
+                        ib_score, _ = calc_score('short')
+                        if ib_score >= SCORE_ATTENTION:
+                            msg = (
+                                f"⚡️ <b>РАННИЙ ШОРТ 4H ({ib_score}/10){wl_badge}</b>\n"
+                                f"Монета: <b>{symbol}</b> | 🕯 Внутри свечи\n"
+                                f"Цена: <code>{current_price:.6g}</code>\n"
+                                f"Откат от хая: -{intrabar_pullback:.1f}%"
+                                f" | Объём: x{cur_vol_rel:.1f}\n"
+                                f"Swing High: -{sw_high_pct:.1f}%\n"
+                                f"───────────────────\n"
+                                f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
+                                f"{ssma_label}\n"
+                                + (ew['alert_block'] + "\n" if ew['structure'] != 'neutral' else "")
+                                + (ew_big_label + "\n" if ew_big_label else "")
+                                + (
+                                f"───────────────────\n"
+                                f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
+                                f"{vol_detail}\n"
+                                f"{oi_label}\n"
+                                f"⚠️ Свеча не закрыта — ждите подтверждения\n"
+                                f"───────────────────\n"
+                                f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
+                                f"{build_tv_link(symbol)}"
+                                )
+                            )
+                            send_msg(msg)
+                            sent_attention[ib_key_s] = time.time()
+                            bot_status["attention_sent"] += 1
+                            logging.info(
+                                f"РАННИЙ ШОРТ: {symbol} "
+                                f"pullback={intrabar_pullback:.1f}% vol=x{cur_vol_rel:.1f}"
+                            )
+
+                    # ══════════════════════════════════════════════════
                     # ЛОНГ — ВНИМАНИЕ
                     # Условие: цена в пределах 2% от Swing Low
                     # SSMA ворота обязательны
@@ -1379,6 +1530,8 @@ def analyst_loop():
                                 f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
                                 f"{ssma_label}\n"
                                 f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
+                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
+                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
                                 f"{vol_detail}\n"
@@ -1423,6 +1576,7 @@ def analyst_loop():
                                 f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
                                 f"{ssma_label}\n"
                                 f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
+                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
                                 f"{vol_detail}\n"
@@ -1502,6 +1656,7 @@ def analyst_loop():
                                 f"{'🏔️ Swing Low: +' + f'{sw_low_pct:.1f}%' if near_sw_low else ''}\n"
                                 f"{ssma_label}\n"
                                 f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
+                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: <b>{rsi:.1f}</b> | MFI: <b>{mfi:.1f}</b>\n"
                                 f"⚖️ Дисбаланс: {'🟢' if imb>0 else '🔴'} <b>{abs(imb):.0f}%</b>\n"
@@ -1572,6 +1727,7 @@ def analyst_loop():
                                 f"{'🏔️ Swing High: -' + f'{sw_high_pct:.1f}%' if near_sw_high else ''}\n"
                                 f"{ssma_label}\n"
                                 f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
+                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: <b>{rsi:.1f}</b> | MFI: <b>{mfi:.1f}</b>\n"
                                 f"⚖️ Дисбаланс: {'🔴' if imb>0 else '🟢'} <b>{abs(imb):.0f}%</b>\n"
