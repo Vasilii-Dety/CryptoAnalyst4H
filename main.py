@@ -1202,6 +1202,50 @@ def analyst_loop():
                     long_gate  = ssma_allows_long(ssma_val, ssma_trend, ssma_slope, current_price)
                     short_gate = ssma_allows_short(ssma_val, ssma_trend, ssma_slope, current_price)
 
+                    # ── Исключения для SSMA ворот ────────────────
+                    # Два варианта: закрытая свеча и незакрытая (intrabar)
+                    #
+                    # ЗАКРЫТАЯ СВЕЧА: M9/M13 + BB oversold + vol x2 + near_sw
+                    # НЕЗАКРЫТАЯ:     M9/M13 + отскок 3%+ внутри свечи + vol x1.5 + near_sw
+                    # BB ATR на intrabar не используем — свеча не закрыта
+
+                    # Для закрытых свечей (ВНИМАНИЕ / СИГНАЛ)
+                    strong_reversal_l = (
+                        (m9_l or m13_l)
+                        and bb_signal == 'oversold'
+                        and v_rel >= 2.0
+                        and near_sw_low
+                    )
+
+                    # Для незакрытой свечи (РАННИЙ) — BB заменяем на intrabar отскок
+                    strong_reversal_l_intrabar = (
+                        (m9_l or m13_l)
+                        and intrabar_bounce >= 2.0   # сильный отскок = перепроданность в моменте
+                        and cur_vol_rel >= 1.5
+                        and near_sw_low
+                    )
+
+                    if strong_reversal_l or strong_reversal_l_intrabar:
+                        long_gate = True
+
+                    # Аналогично для шорта
+                    strong_reversal_s = (
+                        (m9_s or m13_s)
+                        and bb_signal == 'overbought'
+                        and v_rel >= 2.0
+                        and near_sw_high
+                    )
+
+                    strong_reversal_s_intrabar = (
+                        (m9_s or m13_s)
+                        and intrabar_pullback >= 2.0  # сильный откат = перекупленность в моменте
+                        and cur_vol_rel >= 1.5
+                        and near_sw_high
+                    )
+
+                    if strong_reversal_s or strong_reversal_s_intrabar:
+                        short_gate = True
+
                     ssma_label = ""
                     if ssma_val:
                         icon = "📈" if 'bull' in ssma_trend else "📉"
