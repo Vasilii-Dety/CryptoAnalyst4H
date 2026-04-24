@@ -112,15 +112,19 @@ def ssma_allows_long(ssma_val, ssma_trend, ssma_slope, current_price):
 
 def ssma_allows_short(ssma_val, ssma_trend, ssma_slope, current_price):
     """
-    SSMA ворота для шорта.
-    Разрешён если: цена ниже SSMA ИЛИ SSMA падает.
-    Заблокирован если: цена ВЫШЕ SSMA И SSMA растёт.
+    SSMA ворота для шорта — ужесточённые.
+    Разрешён если:
+      (цена ниже SSMA И SSMA падает)
+      ИЛИ SSMA падает сильно (slope < -0.05%/св)
+    Блокирован если:
+      цена чуть ниже SSMA но SSMA ещё растёт (случай NEAR)
     """
     if ssma_val is None:
         return True
-    price_below = current_price < ssma_val
+    price_below  = current_price < ssma_val
     ssma_falling = ssma_slope < 0
-    return price_below or ssma_falling
+    strong_fall  = ssma_slope < -0.05
+    return (price_below and ssma_falling) or strong_fall
 
 
 # ─────────────────────────────────────────────
@@ -1209,7 +1213,7 @@ def analyst_loop():
 
                     # Swing HILO
                     sw_low_pct, sw_high_pct, near_sw_low, near_sw_high, sw_low, sw_high = \
-                        calculate_swing_hilo(closed, swing_bars=34)
+                        calculate_swing_hilo(closed, swing_bars=20)
 
                     # CVD
                     cvd_level, cvd_total = calc_cvd_level(closed)
@@ -1291,18 +1295,19 @@ def analyst_loop():
                     v_avg_cur = np.mean([x[5] for x in closed[-20:]]) if len(closed) >= 20 else 1.0
                     cur_vol_rel = cur_candle[5] / v_avg_cur if v_avg_cur > 0 else 1.0
 
-                    # Разворот у хая: откат >2.5% + объём аномальный = ранний шорт-сигнал
+                    # Разворот у хая: откат >1.5% + объём x1.2+ = ранний шорт-сигнал
+                    # Порог снижен: 4H свеча редко даёт 2.5% отката внутри
                     intrabar_top_reversal = (
-                        intrabar_pullback >= 2.5
-                        and cur_vol_rel >= 1.5
-                        and current_price < intrabar_high * 0.975
+                        intrabar_pullback >= 1.5
+                        and cur_vol_rel >= 1.2
+                        and current_price < intrabar_high * 0.985
                         and short_gate
                     )
-                    # Разворот у лоя: отскок >2.5% + объём аномальный = ранний лонг-сигнал
+                    # Разворот у лоя: отскок >1.5% + объём x1.2+ = ранний лонг-сигнал
                     intrabar_bottom_reversal = (
-                        intrabar_bounce >= 2.5
-                        and cur_vol_rel >= 1.5
-                        and current_price > intrabar_low * 1.025
+                        intrabar_bounce >= 1.5
+                        and cur_vol_rel >= 1.2
+                        and current_price > intrabar_low * 1.015
                         and long_gate
                     )
 
