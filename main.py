@@ -1202,125 +1202,6 @@ def analyst_loop():
                     long_gate  = ssma_allows_long(ssma_val, ssma_trend, ssma_slope, current_price)
                     short_gate = ssma_allows_short(ssma_val, ssma_trend, ssma_slope, current_price)
 
-                    # ── Исключения для SSMA ворот ────────────────
-                    # Два варианта: закрытая свеча и незакрытая (intrabar)
-                    #
-                    # ЗАКРЫТАЯ СВЕЧА: M9/M13 + BB oversold + vol x2 + near_sw
-                    # НЕЗАКРЫТАЯ:     M9/M13 + отскок 3%+ внутри свечи + vol x1.5 + near_sw
-                    # BB ATR на intrabar не используем — свеча не закрыта
-
-                    # Для закрытых свечей (ВНИМАНИЕ / СИГНАЛ)
-                    strong_reversal_l = (
-                        (m9_l or m13_l)
-                        and bb_signal == 'oversold'
-                        and v_rel >= 2.0
-                        and near_sw_low
-                    )
-
-                    # Для незакрытой свечи (РАННИЙ) — BB заменяем на intrabar отскок
-                    strong_reversal_l_intrabar = (
-                        (m9_l or m13_l)
-                        and intrabar_bounce >= 2.0   # сильный отскок = перепроданность в моменте
-                        and cur_vol_rel >= 1.5
-                        and near_sw_low
-                    )
-
-                    if strong_reversal_l or strong_reversal_l_intrabar:
-                        long_gate = True
-
-                    # Аналогично для шорта
-                    strong_reversal_s = (
-                        (m9_s or m13_s)
-                        and bb_signal == 'overbought'
-                        and v_rel >= 2.0
-                        and near_sw_high
-                    )
-
-                    strong_reversal_s_intrabar = (
-                        (m9_s or m13_s)
-                        and intrabar_pullback >= 2.0  # сильный откат = перекупленность в моменте
-                        and cur_vol_rel >= 1.5
-                        and near_sw_high
-                    )
-
-                    if strong_reversal_s or strong_reversal_s_intrabar:
-                        short_gate = True
-
-                    ssma_label = ""
-                    if ssma_val:
-                        icon = "📈" if 'bull' in ssma_trend else "📉"
-                        ssma_label = f"{icon} SSMA: {ssma_val:.4g} ({ssma_slope:+.2f}%/св)"
-
-                    # BB ATR
-                    bb_signal, bb_dist, bb_upper, bb_lower, bb_basis = \
-                        calculate_bb_outside_atr(closed)
-
-                    # Swing HILO
-                    sw_low_pct, sw_high_pct, near_sw_low, near_sw_high, sw_low, sw_high = \
-                        calculate_swing_hilo(closed, swing_bars=20)
-
-                    # CVD
-                    cvd_level, cvd_total = calc_cvd_level(closed)
-                    cvd_div_l = get_cvd_divergence(closed, 'long')
-                    cvd_div_s = get_cvd_divergence(closed, 'short')
-
-                    # RSI div
-                    rsi_div_bull, rsi_div_bear = calc_rsi_divergence(closed)
-
-                    # Молот
-                    hammer_l = check_hammer(ohlcv, 'long')
-                    hammer_s = check_hammer(ohlcv, 'short')
-
-                    # DeMark
-                    m9_l, m9_perfect_l, m13_l = update_td_counters(ohlcv, 'long')
-                    m9_s, m9_perfect_s, m13_s = update_td_counters(ohlcv, 'short')
-
-                    # Pivot
-                    supports, resistances = get_pivot_levels(closed)
-                    sup = supports[0]    if supports    else min(x[3] for x in closed[-60:])
-                    res = resistances[0] if resistances else max(x[2] for x in closed[-60:])
-
-                    # ATR цели
-                    stop_k, take_k, rr_str = dynamic_atr_multipliers(ctx['btc_vol'])
-                    if atr:
-                        stop_l = current_price - stop_k * atr; target_l = current_price + take_k * atr
-                        stop_s = current_price + stop_k * atr; target_s = current_price - take_k * atr
-                    else:
-                        stop_l = stop_s = target_l = target_s = None
-
-                    # Wyckoff
-                    wyckoff_phase, wyckoff_long_ok, wyckoff_short_ok, wyckoff_label, wyckoff_strength = \
-                        detect_wyckoff_phase(closed, sw_low or sup, sw_high or res, cvd_level)
-
-                    # Фильтр после большого движения
-                    after_dump, after_pump, big_move_pct, candles_since_move = \
-                        check_post_move_filter(ohlcv, lookback=12)
-
-                    if after_dump and not wyckoff_long_ok:
-                        wyckoff_long_ok  = True; wyckoff_short_ok = False
-                        wyckoff_label    = f"🌱 После дампа -{big_move_pct:.0f}%"
-                    if after_pump and not wyckoff_short_ok:
-                        wyckoff_short_ok = True; wyckoff_long_ok  = False
-                        wyckoff_label    = f"🔝 После памп +{big_move_pct:.0f}%"
-
-                    # Эллиотт волны — два уровня
-                    # Локальный (10 баров) — текущая волновая структура
-                    # Глобальный (20 баров) — большой цикл
-                    ew       = analyze_elliott(closed, swing_bars=10)
-                    ew_big   = analyze_elliott(closed, swing_bars=20)
-
-                    # Глобальный контекст для алерта
-                    if ew_big['structure'] != 'neutral' and ew_big['wave_label'] != ew['wave_label']:
-                        ew_big_label = f"🌍 Глобально: <b>{ew_big['wave_label']}</b>"
-                        if ew_big['ext_1618']:
-                            ew_big_label += (
-                                f"\n   Цели W3 (глоб): "
-                                f"×1.618={ew_big['ext_1618']:.4g} | "
-                                f"×2.618={ew_big['ext_2618']:.4g}"
-                            )
-                    else:
-                        ew_big_label = ""
-
                     # ── Анализ незакрытой свечи (инtrabar) ──
                     # Смотрим на текущую незакрытую свечу
                     # Если цена откатила >3% от внутридневного хая = потенциальный разворот вниз
@@ -1354,6 +1235,111 @@ def analyst_loop():
                         and current_price > intrabar_low * 1.015
                         and long_gate
                     )
+
+                    # ── SSMA метка ──
+                    ssma_label = ""
+                    if ssma_val:
+                        icon = "📈" if 'bull' in ssma_trend else "📉"
+                        ssma_label = f"{icon} SSMA: {ssma_val:.4g} ({ssma_slope:+.2f}%/св)"
+
+                    # BB ATR
+                    bb_signal, bb_dist, bb_upper, bb_lower, bb_basis =                         calculate_bb_outside_atr(closed)
+
+                    # Swing HILO
+                    sw_low_pct, sw_high_pct, near_sw_low, near_sw_high, sw_low, sw_high =                         calculate_swing_hilo(closed, swing_bars=20)
+
+                    # CVD
+                    cvd_level, cvd_total = calc_cvd_level(closed)
+                    cvd_div_l = get_cvd_divergence(closed, 'long')
+                    cvd_div_s = get_cvd_divergence(closed, 'short')
+
+                    # RSI дивергенция
+                    rsi_div_bull, rsi_div_bear = calc_rsi_divergence(closed)
+
+                    # Молот
+                    hammer_l = check_hammer(ohlcv, 'long')
+                    hammer_s = check_hammer(ohlcv, 'short')
+
+                    # DeMark
+                    m9_l, m9_perfect_l, m13_l = update_td_counters(ohlcv, 'long')
+                    m9_s, m9_perfect_s, m13_s = update_td_counters(ohlcv, 'short')
+
+                    # Pivot
+                    supports, resistances = get_pivot_levels(closed)
+                    sup = supports[0]    if supports    else min(x[3] for x in closed[-60:])
+                    res = resistances[0] if resistances else max(x[2] for x in closed[-60:])
+
+                    # ATR цели
+                    stop_k, take_k, rr_str = dynamic_atr_multipliers(ctx['btc_vol'])
+                    if atr:
+                        stop_l = current_price - stop_k * atr
+                        target_l = current_price + take_k * atr
+                        stop_s = current_price + stop_k * atr
+                        target_s = current_price - take_k * atr
+                    else:
+                        stop_l = stop_s = target_l = target_s = None
+
+                    # Wyckoff
+                    wyckoff_phase, wyckoff_long_ok, wyckoff_short_ok, wyckoff_label, wyckoff_strength =                         detect_wyckoff_phase(closed, sw_low or sup, sw_high or res, cvd_level)
+
+                    # Фильтр после большого движения
+                    after_dump, after_pump, big_move_pct, candles_since_move =                         check_post_move_filter(ohlcv, lookback=12)
+
+                    if after_dump and not wyckoff_long_ok:
+                        wyckoff_long_ok  = True; wyckoff_short_ok = False
+                        wyckoff_label    = f"🌱 После дампа -{big_move_pct:.0f}%"
+                    if after_pump and not wyckoff_short_ok:
+                        wyckoff_short_ok = True; wyckoff_long_ok  = False
+                        wyckoff_label    = f"🔝 После памп +{big_move_pct:.0f}%"
+
+                    # Эллиотт волны — два уровня
+                    ew     = analyze_elliott(closed, swing_bars=10)
+                    ew_big = analyze_elliott(closed, swing_bars=20)
+
+                    if ew_big['structure'] != 'neutral' and ew_big['wave_label'] != ew['wave_label']:
+                        ew_big_label = f"🌍 Глобально: <b>{ew_big['wave_label']}</b>"
+                        if ew_big['ext_1618']:
+                            ew_big_label += (
+                                f"\n   Цели W3 (глоб): "
+                                f"×1.618={ew_big['ext_1618']:.4g} | "
+                                f"×2.618={ew_big['ext_2618']:.4g}"
+                            )
+                    else:
+                        ew_big_label = ""
+
+                    # ── Исключения для SSMA ворот ──
+                    # Используем m9_l/m9_s которые теперь объявлены выше
+                    # ЗАКРЫТАЯ СВЕЧА: M9/M13 + BB oversold + vol x2 + near_sw
+                    strong_reversal_l = (
+                        (m9_l or m13_l)
+                        and bb_signal == 'oversold'
+                        and v_rel >= 2.0
+                        and near_sw_low
+                    )
+                    # НЕЗАКРЫТАЯ СВЕЧА: M9/M13 + отскок 2%+ + vol x1.5 + near_sw
+                    strong_reversal_l_intrabar = (
+                        (m9_l or m13_l)
+                        and intrabar_bounce >= 2.0
+                        and cur_vol_rel >= 1.5
+                        and near_sw_low
+                    )
+                    if strong_reversal_l or strong_reversal_l_intrabar:
+                        long_gate = True
+
+                    strong_reversal_s = (
+                        (m9_s or m13_s)
+                        and bb_signal == 'overbought'
+                        and v_rel >= 2.0
+                        and near_sw_high
+                    )
+                    strong_reversal_s_intrabar = (
+                        (m9_s or m13_s)
+                        and intrabar_pullback >= 2.0
+                        and cur_vol_rel >= 1.5
+                        and near_sw_high
+                    )
+                    if strong_reversal_s or strong_reversal_s_intrabar:
+                        short_gate = True
 
                     # OI и фандинг
                     has_any = (cvd_div_l or cvd_div_s or hammer_l or hammer_s or
