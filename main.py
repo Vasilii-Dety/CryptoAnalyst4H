@@ -1220,9 +1220,10 @@ def analyst_loop():
                  for s in active_swaps if s in tickers],
                 key=lambda x: x['v'], reverse=True)
 
-            top250  = [x['s'] for x in vol_data[:250]]
-            symbols = list(dict.fromkeys(
-                [w for w in WATCHLIST if w in tickers] + top250))
+            # 4H: топ 100 монет — жёсткие фильтры, нужны только ликвидные
+            top100_4h = [x['s'] for x in vol_data[:100]]
+            symbols   = list(dict.fromkeys(
+                [w for w in WATCHLIST if w in tickers] + top100_4h))
 
             for symbol in symbols:
                 try:
@@ -1881,10 +1882,11 @@ def analyst_loop():
             # 2H СКАН — РАННИЕ СИГНАЛЫ + СЖАТИЕ ВОЛАТИЛЬНОСТИ
             # Топ 100 монет по объёму, только РАННИЙ алерт
             # ══════════════════════════════════════════════════
-            top100_2h = [x['s'] for x in vol_data[:100]
+            # 2H: топ 250 монет — мягкие фильтры, больше ранних сигналов
+            top250_2h = [x['s'] for x in vol_data[:250]
                          if tickers.get(x['s'], {}).get('quoteVolume', 0) >= MIN_VOLUME_ATTENTION]
 
-            for symbol in top100_2h:
+            for symbol in top250_2h:
                 try:
                     vol_24h_2h = tickers.get(symbol, {}).get('quoteVolume', 0) or 0
 
@@ -1930,6 +1932,11 @@ def analyst_loop():
                     long_gate_2h  = ssma_allows_long(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
                     short_gate_2h = ssma_allows_short(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
 
+                    # Исключение SSMA для 2H: сжатие + CVD bull + отскок 2%
+                    # Перед взрывом цена часто в "тоннеле" ниже SSMA
+                    # Сжатие + бычий CVD = достаточное подтверждение
+                    # (вычисляется после detect_volatility_squeeze)
+
                     sw_lp_2h, sw_hp_2h, near_sl_2h, near_sh_2h, sw_l_2h, sw_h_2h = \
                         calculate_swing_hilo(ohlcv_2h, swing_bars=20)
 
@@ -1939,6 +1946,18 @@ def analyst_loop():
 
                     is_sq, sq_ratio, sq_slope, sq_bars, sq_label = \
                         detect_volatility_squeeze(closed_2h, period=5, avg_period=20)
+
+                    # Исключение SSMA ворот для 2H:
+                    # Сжатие + CVD bull + отскок 2%+ → открываем лонг ворота
+                    # Сжатие + CVD bear + откат 2%+ → открываем шорт ворота
+                    if (not long_gate_2h and is_sq
+                            and cvd_level_2h in ('bull', 'bull_div')
+                            and ib_bounce_2h >= 2.0):
+                        long_gate_2h = True
+                    if (not short_gate_2h and is_sq
+                            and cvd_level_2h in ('bear', 'bear_div')
+                            and ib_pullback_2h >= 2.0):
+                        short_gate_2h = True
 
                     wl_2h = " ⭐️" if symbol in WATCHLIST else ""
                     ssma_lbl_2h = ""
@@ -1955,12 +1974,25 @@ def analyst_loop():
                             and is_sq
                             and vol_24h_2h >= MIN_VOLUME_ATTENTION
                             and cur_vol_2h < 1.5):
+                        # Определяем вероятное направление взрыва по контексту
+                        if ssma_trend_2h in ('bull_strong', 'bull_weak') and cvd_level_2h in ('bull', 'bull_div'):
+                            sq_direction = "⚡️ Вероятный взрыв: ВВЕРХ 📈"
+                        elif ssma_trend_2h in ('bear_strong', 'bear_weak') and cvd_level_2h in ('bear', 'bear_div'):
+                            sq_direction = "⚡️ Вероятный взрыв: ВНИЗ 📉"
+                        elif cvd_level_2h in ('bull_div', 'bull') and sq_slope > 0:
+                            sq_direction = "⚡️ Вероятный взрыв: ВВЕРХ 📈 (CVD)"
+                        elif cvd_level_2h in ('bear_div', 'bear') and sq_slope < 0:
+                            sq_direction = "⚡️ Вероятный взрыв: ВНИЗ 📉 (CVD)"
+                        else:
+                            sq_direction = "⚪️ Направление не определено — смотри пробой"
+
                         msg = "\n".join([
                             f"🗜 <b>СЖАТИЕ 2H{wl_2h}</b>",
                             f"Монета: <b>{symbol}</b>",
                             f"Цена: <code>{current_2h:.6g}</code>",
                             "───────────────────",
                             sq_label,
+                            sq_direction,
                             "───────────────────",
                             ssma_lbl_2h,
                             f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
