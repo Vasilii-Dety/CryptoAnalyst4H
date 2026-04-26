@@ -49,12 +49,13 @@ SCORE_ATTENTION      = 4           # порог ВНИМАНИЕ
 SWING_ATTENTION_PCT  = 3.0         # % от Swing High/Low для ВНИМАНИЕ
 
 bot_status = {
-    "started_at":     datetime.now().isoformat(),
-    "last_iteration": None,
-    "iterations":     0,
-    "errors":         0,
-    "signals_sent":   0,
-    "attention_sent": 0,
+    "started_at":       datetime.now().isoformat(),
+    "last_iteration":   None,
+    "iterations":       0,
+    "errors":           0,
+    "signals_sent":     0,
+    "attention_sent":   0,
+    "early_2h_sent":    0,
 }
 
 oi_cache: dict = {}
@@ -1102,6 +1103,84 @@ def adaptive_threshold(base, btc_vol, is_priority):
     return max(t, 3)
 
 
+
+# ─────────────────────────────────────────────
+# СЖАТИЕ ВОЛАТИЛЬНОСТИ (Volatility Squeeze)
+# Свечи маленькие + боковик + наклон вверх = готов к взрыву
+#
+# Логика:
+#   ATR compression: recent_atr / avg_atr < 0.6
+#   Inside bars:     последние N свечей в диапазоне предыдущей
+#   Наклон:          цена слегка растёт (slope > 0)
+# ─────────────────────────────────────────────
+def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
+    """
+    Определяет сжатие волатильности перед взрывом.
+    Возвращает:
+      is_squeeze:   True если сжатие есть
+      squeeze_ratio: current_atr / avg_atr (чем меньше, тем сильнее сжатие)
+      slope_pct:    наклон цены за period свечей (+ = вверх)
+      bars_count:   сколько свечей подряд в сжатии
+      label:        строка для алерта
+    """
+    if len(ohlcv) < avg_period + period + 1:
+        return False, 1.0, 0.0, 0, ""
+
+    closes = [c[4] for c in ohlcv]
+    highs  = [c[2] for c in ohlcv]
+    lows   = [c[3] for c in ohlcv]
+
+    # ATR за последние period свечей (текущее сжатие)
+    def calc_atr_range(start, end):
+        trs = []
+        for i in range(start + 1, end):
+            h  = highs[i]; l = lows[i]; pc = closes[i-1]
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return np.mean(trs) if trs else 0.0
+
+    recent_atr = calc_atr_range(len(ohlcv) - period - 1, len(ohlcv))
+    avg_atr    = calc_atr_range(len(ohlcv) - avg_period - 1, len(ohlcv) - period)
+
+    if avg_atr == 0:
+        return False, 1.0, 0.0, 0, ""
+
+    squeeze_ratio = recent_atr / avg_atr
+
+    # Наклон цены за последние period свечей
+    slope_pct = (closes[-1] - closes[-period - 1]) / closes[-period - 1] * 100                 if closes[-period - 1] > 0 else 0.0
+
+    # Считаем сколько свечей подряд меньше средней ATR
+    bars_count = 0
+    for i in range(len(ohlcv) - 1, len(ohlcv) - period - 1, -1):
+        if i < 1: break
+        bar_range = highs[i] - lows[i]
+        if bar_range < avg_atr * 0.7:
+            bars_count += 1
+        else:
+            break
+
+    # Сжатие: ATR < 60% от среднего + минимум 3 свечи подряд
+    is_squeeze = squeeze_ratio < 0.6 and bars_count >= 3
+
+    if not is_squeeze:
+        return False, squeeze_ratio, slope_pct, bars_count, ""
+
+    # Определяем направление наклона
+    if slope_pct > 0.5:
+        direction = "↗️ наклон вверх"
+    elif slope_pct < -0.5:
+        direction = "↘️ наклон вниз"
+    else:
+        direction = "→ боковик"
+
+    label = (
+        f"🗜 Сжатие: {bars_count} св | ATR x{squeeze_ratio:.2f} | "
+        f"{direction} ({slope_pct:+.1f}%) | ⚡️ Готов к взрыву"
+    )
+
+    return True, squeeze_ratio, slope_pct, bars_count, label
+
+
 # ─────────────────────────────────────────────
 # ОСНОВНОЙ ЦИКЛ
 # ─────────────────────────────────────────────
@@ -1295,6 +1374,9 @@ def analyst_loop():
                     # Эллиотт волны — два уровня
                     ew     = analyze_elliott(closed, swing_bars=10)
                     ew_big = analyze_elliott(closed, swing_bars=20)
+                    # Сжатие волатильности на 4H
+                    is_sq_4h, sq_ratio_4h, sq_slope_4h, sq_bars_4h, sq_label_4h = \
+                        detect_volatility_squeeze(closed, period=5, avg_period=20)
 
                     if ew_big['structure'] != 'neutral' and ew_big['wave_label'] != ew['wave_label']:
                         ew_big_label = f"🌍 Глобально: <b>{ew_big['wave_label']}</b>"
@@ -1567,6 +1649,7 @@ def analyst_loop():
                                 f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
                                 f"{ew_big_label + chr(10) if ew_big_label else ''}"
                                 f"{ew_big_label + chr(10) if ew_big_label else ''}"
+                                f"{sq_label_4h + chr(10) if is_sq_4h else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
                                 f"{vol_detail}\n"
@@ -1794,14 +1877,182 @@ def analyst_loop():
                 except Exception as e:
                     logging.error(f"Ошибка {symbol}: {e}")
 
+            # ══════════════════════════════════════════════════
+            # 2H СКАН — РАННИЕ СИГНАЛЫ + СЖАТИЕ ВОЛАТИЛЬНОСТИ
+            # Топ 100 монет по объёму, только РАННИЙ алерт
+            # ══════════════════════════════════════════════════
+            top100_2h = [x['s'] for x in vol_data[:100]
+                         if tickers.get(x['s'], {}).get('quoteVolume', 0) >= MIN_VOLUME_ATTENTION]
+
+            for symbol in top100_2h:
+                try:
+                    vol_24h_2h = tickers.get(symbol, {}).get('quoteVolume', 0) or 0
+
+                    ohlcv_2h = None
+                    for attempt in range(2):
+                        try:
+                            ohlcv_2h = exchange.fetch_ohlcv(symbol, '2h', limit=80); break
+                        except ccxt.NetworkError as e:
+                            if attempt == 0: time.sleep(3)
+                            else: raise
+                    if ohlcv_2h is None or len(ohlcv_2h) < 40:
+                        continue
+
+                    closed_2h   = ohlcv_2h[:-1]
+                    closes_2h   = [x[4] for x in closed_2h]
+                    current_2h  = ohlcv_2h[-1][4]
+
+                    last_ts_2h  = closed_2h[-1][0]
+                    cid_2h      = last_ts_2h // 7_200_000
+
+                    ib2_key_l = f"{symbol}_{cid_2h}_2h_ibl"
+                    ib2_key_s = f"{symbol}_{cid_2h}_2h_ibs"
+                    sq2_key   = f"{symbol}_{cid_2h}_2h_sq"
+
+                    if (ib2_key_l in sent_attention
+                            and ib2_key_s in sent_attention
+                            and sq2_key in sent_attention):
+                        continue
+
+                    # Базовые индикаторы 2H
+                    rsi_2h    = calculate_rsi_wilder(closes_2h)
+                    v_hist_2h = [x[5] for x in closed_2h[-21:-1]]
+                    v_avg_2h  = np.mean(v_hist_2h) if v_hist_2h else 1.0
+
+                    cur_2h         = ohlcv_2h[-1]
+                    ib_high_2h     = cur_2h[2]
+                    ib_low_2h      = cur_2h[3]
+                    ib_bounce_2h   = (current_2h - ib_low_2h)  / ib_low_2h  * 100 if ib_low_2h  > 0 else 0.0
+                    ib_pullback_2h = (ib_high_2h - current_2h) / ib_high_2h * 100 if ib_high_2h > 0 else 0.0
+                    cur_vol_2h     = cur_2h[5] / v_avg_2h if v_avg_2h > 0 else 1.0
+
+                    ssma_2h, ssma_trend_2h, ssma_slope_2h = calculate_ssma(closed_2h, period=24)
+                    long_gate_2h  = ssma_allows_long(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
+                    short_gate_2h = ssma_allows_short(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
+
+                    sw_lp_2h, sw_hp_2h, near_sl_2h, near_sh_2h, sw_l_2h, sw_h_2h = \
+                        calculate_swing_hilo(ohlcv_2h, swing_bars=20)
+
+                    cvd_level_2h, _ = calc_cvd_level(closed_2h)
+                    cvd_emoji_2h = {"bull":"🟢","bull_div":"🟢✨",
+                                    "bear":"🔴","bear_div":"🔴✨"}.get(cvd_level_2h, "⚪️")
+
+                    is_sq, sq_ratio, sq_slope, sq_bars, sq_label = \
+                        detect_volatility_squeeze(closed_2h, period=5, avg_period=20)
+
+                    wl_2h = " ⭐️" if symbol in WATCHLIST else ""
+                    ssma_lbl_2h = ""
+                    if ssma_2h:
+                        icon = "📈" if 'bull' in ssma_trend_2h else "📉"
+                        ssma_lbl_2h = f"{icon} SSMA 2H: {ssma_2h:.4g} ({ssma_slope_2h:+.2f}%/св)"
+
+                    tv = build_tv_link(symbol)
+                    btc_line = f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%"
+                    vol_line = f"📦 Объём 24H: ${vol_24h_2h/1_000_000:.1f}M"
+
+                    # ── СЖАТИЕ ──
+                    if (sq2_key not in sent_attention
+                            and is_sq
+                            and vol_24h_2h >= MIN_VOLUME_ATTENTION
+                            and cur_vol_2h < 1.5):
+                        msg = "\n".join([
+                            f"🗜 <b>СЖАТИЕ 2H{wl_2h}</b>",
+                            f"Монета: <b>{symbol}</b>",
+                            f"Цена: <code>{current_2h:.6g}</code>",
+                            "───────────────────",
+                            sq_label,
+                            "───────────────────",
+                            ssma_lbl_2h,
+                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
+                            f"📊 RSI 2H: {rsi_2h:.1f}",
+                            vol_line,
+                            "───────────────────",
+                            btc_line,
+                            tv
+                        ])
+                        send_msg(msg)
+                        sent_attention[sq2_key] = time.time()
+                        bot_status["early_2h_sent"] += 1
+                        logging.info(f"СЖАТИЕ 2H: {symbol} ratio={sq_ratio:.2f} bars={sq_bars}")
+
+                    # ── РАННИЙ ЛОНГ 2H ──
+                    if (ib2_key_l not in sent_attention
+                            and ib_bounce_2h >= 1.5
+                            and cur_vol_2h >= 1.2
+                            and long_gate_2h
+                            and near_sl_2h
+                            and vol_24h_2h >= MIN_VOLUME_ATTENTION):
+                        parts = [
+                            f"⚡️ <b>РАННИЙ ЛОНГ 2H{wl_2h}</b>",
+                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
+                            f"Цена: <code>{current_2h:.6g}</code>",
+                            f"Отскок от лоя: +{ib_bounce_2h:.1f}% | Объём: x{cur_vol_2h:.1f}",
+                            f"Swing Low 2H: +{sw_lp_2h:.1f}%",
+                            "───────────────────",
+                            ssma_lbl_2h,
+                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
+                            f"📊 RSI 2H: {rsi_2h:.1f}",
+                            vol_line,
+                        ]
+                        if is_sq:
+                            parts.append(sq_label)
+                        parts += [
+                            "───────────────────",
+                            "⚠️ Свеча 2H не закрыта — ждите подтверждения",
+                            btc_line, tv
+                        ]
+                        send_msg("\n".join(parts))
+                        sent_attention[ib2_key_l] = time.time()
+                        bot_status["early_2h_sent"] += 1
+                        logging.info(f"РАННИЙ ЛОНГ 2H: {symbol} bounce={ib_bounce_2h:.1f}%")
+
+                    # ── РАННИЙ ШОРТ 2H ──
+                    if (ib2_key_s not in sent_attention
+                            and ib_pullback_2h >= 1.5
+                            and cur_vol_2h >= 1.2
+                            and short_gate_2h
+                            and near_sh_2h
+                            and vol_24h_2h >= MIN_VOLUME_ATTENTION):
+                        parts = [
+                            f"⚡️ <b>РАННИЙ ШОРТ 2H{wl_2h}</b>",
+                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
+                            f"Цена: <code>{current_2h:.6g}</code>",
+                            f"Откат от хая: -{ib_pullback_2h:.1f}% | Объём: x{cur_vol_2h:.1f}",
+                            f"Swing High 2H: -{sw_hp_2h:.1f}%",
+                            "───────────────────",
+                            ssma_lbl_2h,
+                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
+                            f"📊 RSI 2H: {rsi_2h:.1f}",
+                            vol_line,
+                        ]
+                        if is_sq:
+                            parts.append(sq_label)
+                        parts += [
+                            "───────────────────",
+                            "⚠️ Свеча 2H не закрыта — ждите подтверждения",
+                            btc_line, tv
+                        ]
+                        send_msg("\n".join(parts))
+                        sent_attention[ib2_key_s] = time.time()
+                        bot_status["early_2h_sent"] += 1
+                        logging.info(f"РАННИЙ ШОРТ 2H: {symbol} pullback={ib_pullback_2h:.1f}%")
+
+                except ccxt.RateLimitExceeded:
+                    logging.warning(f"Rate limit 2H {symbol}, пауза 30с"); time.sleep(30)
+                except ccxt.NetworkError as e:
+                    logging.error(f"Network 2H {symbol}: {e}")
+                except Exception as e:
+                    logging.error(f"Ошибка 2H {symbol}: {e}")
+
             now = time.time()
             sent_signals   = {k: v for k, v in sent_signals.items()   if now - v < 86400}
             sent_attention = {k: v for k, v in sent_attention.items() if now - v < 86400}
             bot_status["iterations"]    += 1
             bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
-            logging.info(f"Итерация. Символов: {len(symbols)} | "
+            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H: {len(top100_2h)} | "
                          f"Сигналов: {bot_status['signals_sent']} | "
                          f"Внимание: {bot_status['attention_sent']} | "
+                         f"Ранних 2H: {bot_status['early_2h_sent']} | "
                          f"BTC vol: {ctx['btc_vol']:.2f}%")
             time.sleep(300)
 
