@@ -1154,13 +1154,13 @@ def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
     for i in range(len(ohlcv) - 1, len(ohlcv) - period - 1, -1):
         if i < 1: break
         bar_range = highs[i] - lows[i]
-        if bar_range < avg_atr * 0.7:
+        if bar_range < avg_atr * 0.8:
             bars_count += 1
         else:
             break
 
     # Сжатие: ATR < 60% от среднего + минимум 3 свечи подряд
-    is_squeeze = squeeze_ratio < 0.6 and bars_count >= 3
+    is_squeeze = squeeze_ratio < 0.7 and bars_count >= 3
 
     if not is_squeeze:
         return False, squeeze_ratio, slope_pct, bars_count, ""
@@ -1938,7 +1938,7 @@ def analyst_loop():
                     # (вычисляется после detect_volatility_squeeze)
 
                     sw_lp_2h, sw_hp_2h, near_sl_2h, near_sh_2h, sw_l_2h, sw_h_2h = \
-                        calculate_swing_hilo(ohlcv_2h, swing_bars=20)
+                        calculate_swing_hilo(ohlcv_2h, swing_bars=10)
 
                     cvd_level_2h, _ = calc_cvd_level(closed_2h)
                     cvd_emoji_2h = {"bull":"🟢","bull_div":"🟢✨",
@@ -1952,11 +1952,11 @@ def analyst_loop():
                     # Сжатие + CVD bear + откат 2%+ → открываем шорт ворота
                     if (not long_gate_2h and is_sq
                             and cvd_level_2h in ('bull', 'bull_div')
-                            and ib_bounce_2h >= 2.0):
+                            and ib_bounce_2h >= 1.5):
                         long_gate_2h = True
                     if (not short_gate_2h and is_sq
                             and cvd_level_2h in ('bear', 'bear_div')
-                            and ib_pullback_2h >= 2.0):
+                            and ib_pullback_2h >= 1.5):
                         short_gate_2h = True
 
                     wl_2h = " ⭐️" if symbol in WATCHLIST else ""
@@ -2009,7 +2009,7 @@ def analyst_loop():
 
                     # ── РАННИЙ ЛОНГ 2H ──
                     if (ib2_key_l not in sent_attention
-                            and ib_bounce_2h >= 1.5
+                            and ib_bounce_2h >= 1.0
                             and cur_vol_2h >= 1.2
                             and long_gate_2h
                             and near_sl_2h
@@ -2040,7 +2040,7 @@ def analyst_loop():
 
                     # ── РАННИЙ ШОРТ 2H ──
                     if (ib2_key_s not in sent_attention
-                            and ib_pullback_2h >= 1.5
+                            and ib_pullback_2h >= 1.0
                             and cur_vol_2h >= 1.2
                             and short_gate_2h
                             and near_sh_2h
