@@ -1154,13 +1154,13 @@ def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
     for i in range(len(ohlcv) - 1, len(ohlcv) - period - 1, -1):
         if i < 1: break
         bar_range = highs[i] - lows[i]
-        if bar_range < avg_atr * 0.8:
+        if bar_range < avg_atr * 0.7:
             bars_count += 1
         else:
             break
 
     # Сжатие: ATR < 60% от среднего + минимум 3 свечи подряд
-    is_squeeze = squeeze_ratio < 0.7 and bars_count >= 3
+    is_squeeze = squeeze_ratio < 0.6 and bars_count >= 3
 
     if not is_squeeze:
         return False, squeeze_ratio, slope_pct, bars_count, ""
@@ -1765,7 +1765,6 @@ def analyst_loop():
                                 f"{ssma_label}\n"
                                 f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
                                 f"{ew_big_label + chr(10) if ew_big_label else ''}"
-                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
                                 f"{sq_label_4h + chr(10) if is_sq_4h else ''}"
                                 f"───────────────────\n"
                                 f"📊 RSI: {rsi:.1f} | MFI: {mfi:.1f}\n"
@@ -2080,6 +2079,19 @@ def analyst_loop():
                     is_sq, sq_ratio, sq_slope, sq_bars, sq_label = \
                         detect_volatility_squeeze(closed_2h, period=5, avg_period=20)
 
+                    # ATR Map — 4-компонентный скор
+                    atr_map_score, atr_map_forming, atr_map_mature, atr_map_label, atr_map_comp = \
+                        detect_atr_map_squeeze(closed_2h)
+
+                    # Объединённый флаг сжатия: наш ИЛИ ATR Map
+                    # ATR Map: только если объём не аномальный
+                    # (если объём уже взорвался - сжатие кончилось)
+                    cur_vol_2h_rel = (ohlcv_2h[-1][5] / 
+                        (sum(x[5] for x in closed_2h[-20:]) / 20)
+                        if closed_2h else 1.0)
+                    atr_map_active = atr_map_forming and cur_vol_2h_rel < 1.5
+                    any_squeeze = is_sq or atr_map_active
+
                     # Исключение SSMA ворот для 2H:
                     # Сжатие + CVD bull + отскок 2%+ → открываем лонг ворота
                     # Сжатие + CVD bear + откат 2%+ → открываем шорт ворота
@@ -2119,12 +2131,26 @@ def analyst_loop():
                         else:
                             sq_direction = "⚪️ Направление не определено — смотри пробой"
 
+                        # Строим блок сжатия — наш + ATR Map
+                        sq_block = []
+                        if is_sq:
+                            sq_block.append(sq_label)
+                        if atr_map_active:
+                            maturity = "🟠 ЗРЕЛОЕ" if atr_map_mature else "🟡 формируется"
+                            sq_block.append(
+                                f"📊 ATR Map: {atr_map_score:.0f}/100 {maturity}\n"
+                                f"   ATR x{atr_map_comp['atr_ratio']:.2f} | "
+                                f"Range {atr_map_comp['range']:.0f} | "
+                                f"Noise {atr_map_comp['noise']:.0f} | "
+                                f"Cont {atr_map_comp['containment']:.0f}"
+                            )
+
                         msg = "\n".join([
                             f"🗜 <b>СЖАТИЕ 2H{wl_2h}</b>",
                             f"Монета: <b>{symbol}</b>",
                             f"Цена: <code>{current_2h:.6g}</code>",
                             "───────────────────",
-                            sq_label,
+                            *sq_block,
                             sq_direction,
                             "───────────────────",
                             ssma_lbl_2h,
