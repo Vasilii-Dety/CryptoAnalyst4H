@@ -1181,6 +1181,122 @@ def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
     return True, squeeze_ratio, slope_pct, bars_count, label
 
 
+def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
+                            range_window=20, noise_window=10,
+                            containment_window=20,
+                            compression_threshold=60, mature_threshold=80):
+    """
+    Сжатие по методике ATR Map — 4-компонентный скор.
+
+    Компоненты:
+      1. ATR Score (вес 30)        — текущий ATR vs baseline ATR
+      2. Range Score (вес 30)      — текущий диапазон vs средний за range_window
+      3. Noise Score (вес 20)      — соотношение тела свечи к полному диапазону
+      4. Containment Score (вес 20)— свечи содержатся внутри предыдущих
+
+    Возвращает:
+      total_score (0-100)
+      is_forming   (score >= 60)
+      is_mature    (score >= 80)
+      label        — описание для алерта
+      components   — детализация по компонентам
+    """
+    if len(ohlcv) < baseline_length + 5:
+        return 0, False, False, "", {}
+
+    closes = [c[4] for c in ohlcv]
+    opens  = [c[1] for c in ohlcv]
+    highs  = [c[2] for c in ohlcv]
+    lows   = [c[3] for c in ohlcv]
+
+    # ── 1. ATR Score ───────────────────────────
+    # Текущий ATR (последние atr_length свечей) vs baseline
+    def atr_calc(start, end):
+        trs = []
+        for i in range(max(start, 1), end):
+            tr = max(highs[i] - lows[i],
+                     abs(highs[i] - closes[i-1]),
+                     abs(lows[i]  - closes[i-1]))
+            trs.append(tr)
+        return np.mean(trs) if trs else 0.0
+
+    n = len(ohlcv)
+    current_atr  = atr_calc(n - atr_length, n)
+    baseline_atr = atr_calc(n - baseline_length, n - atr_length)
+
+    if baseline_atr == 0:
+        return 0, False, False, "", {}
+
+    atr_ratio = current_atr / baseline_atr
+    # Чем меньше ratio — тем сильнее сжатие, скор выше
+    atr_score = max(0, min(100, (1.0 - atr_ratio) * 200))
+
+    # ── 2. Range Score ─────────────────────────
+    # Средний диапазон последних N свечей vs средний за длинный период
+    recent_ranges  = [highs[i] - lows[i] for i in range(n - range_window, n)]
+    long_ranges    = [highs[i] - lows[i] for i in range(n - baseline_length, n - range_window)]
+    avg_recent     = np.mean(recent_ranges) if recent_ranges else 0.0
+    avg_long       = np.mean(long_ranges) if long_ranges else 0.0
+
+    if avg_long == 0:
+        range_score = 0
+    else:
+        range_ratio = avg_recent / avg_long
+        range_score = max(0, min(100, (1.0 - range_ratio) * 200))
+
+    # ── 3. Noise Score ─────────────────────────
+    # Соотношение тела к диапазону — маленькие тела = шум = сжатие
+    body_ratios = []
+    for i in range(n - noise_window, n):
+        full_range = highs[i] - lows[i]
+        body       = abs(closes[i] - opens[i])
+        if full_range > 0:
+            body_ratios.append(body / full_range)
+    avg_body_ratio = np.mean(body_ratios) if body_ratios else 1.0
+    # Чем меньше body_ratio (больше фитилей) — тем больше шума
+    noise_score = max(0, min(100, (1.0 - avg_body_ratio) * 150))
+
+    # ── 4. Containment Score ───────────────────
+    # Свеча содержится внутри предыдущей: high <= prev_high И low >= prev_low
+    contained_count = 0
+    for i in range(n - containment_window, n):
+        if i < 1: continue
+        if highs[i] <= highs[i-1] and lows[i] >= lows[i-1]:
+            contained_count += 1
+    containment_score = (contained_count / containment_window) * 100
+
+    # ── Взвешенный итоговый скор ───────────────
+    total_score = (atr_score * 0.30 +
+                   range_score * 0.30 +
+                   noise_score * 0.20 +
+                   containment_score * 0.20)
+
+    is_forming = total_score >= compression_threshold
+    is_mature  = total_score >= mature_threshold
+
+    components = {
+        'atr':        round(atr_score, 1),
+        'range':      round(range_score, 1),
+        'noise':      round(noise_score, 1),
+        'containment':round(containment_score, 1),
+        'total':      round(total_score, 1),
+        'atr_ratio':  round(atr_ratio, 2),
+    }
+
+    if not is_forming:
+        return total_score, False, False, "", components
+
+    label_lines = [
+        f"📊 ATR Map: {total_score:.0f}/100 "
+        f"({'🟠 ЗРЕЛОЕ' if is_mature else '🟡 формируется'})",
+        f"   ATR x{atr_ratio:.2f} | Range {range_score:.0f} | "
+        f"Noise {noise_score:.0f} | Cont {containment_score:.0f}"
+    ]
+    label = "\n".join(label_lines)
+
+    return total_score, is_forming, is_mature, label, components
+
+
 # ─────────────────────────────────────────────
 # ОСНОВНОЙ ЦИКЛ
 # ─────────────────────────────────────────────
@@ -1893,10 +2009,27 @@ def analyst_loop():
                     ohlcv_2h = None
                     for attempt in range(2):
                         try:
-                            ohlcv_2h = exchange.fetch_ohlcv(symbol, '2h', limit=80); break
+                            ohlcv_raw_1h = exchange.fetch_ohlcv(symbol, '1h', limit=160); break
                         except ccxt.NetworkError as e:
                             if attempt == 0: time.sleep(3)
                             else: raise
+                    # Конвертируем 1H → 2H: объединяем каждые 2 свечи
+                    if ohlcv_raw_1h and len(ohlcv_raw_1h) >= 4:
+                        ohlcv_2h = []
+                        # Берём чётные пары свечей (0+1, 2+3, ...)
+                        for i in range(0, len(ohlcv_raw_1h) - 1, 2):
+                            c1 = ohlcv_raw_1h[i]
+                            c2 = ohlcv_raw_1h[i + 1]
+                            merged = [
+                                c1[0],                      # timestamp (начало)
+                                c1[1],                      # open (первая свеча)
+                                max(c1[2], c2[2]),          # high
+                                min(c1[3], c2[3]),          # low
+                                c2[4],                      # close (вторая свеча)
+                                c1[5] + c2[5]               # volume (сумма)
+                            ]
+                            ohlcv_2h.append(merged)
+
                     if ohlcv_2h is None or len(ohlcv_2h) < 40:
                         continue
 
