@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"✅ АНАЛИТИК v6.0 АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
+    return f"✅ АНАЛИТИК v6.1 АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -37,16 +37,19 @@ WATCHLIST = [
 # ─────────────────────────────────────────────
 # ПОРОГИ ФИЛЬТРОВ
 # ─────────────────────────────────────────────
-MIN_VOLUME_SIGNAL    = 5_000_000   # $5M для СИГНАЛ
-MIN_VOLUME_ATTENTION = 1_000_000   # $1M для ВНИМАНИЕ
-MIN_RR_SIGNAL        = 3.0         # R/R для СИГНАЛ
-MIN_RR_ATTENTION     = 2.0         # R/R для ВНИМАНИЕ
-MIN_TARGET_PCT_SIGNAL    = 5.0     # цель минимум 5% для СИГНАЛ
-MIN_TARGET_PCT_ATTENTION = 2.0     # цель минимум 2% для ВНИМАНИЕ
-MAX_STOP_PCT         = 3.0         # стоп максимум 3%
-SCORE_SIGNAL         = 7           # порог СИГНАЛ
-SCORE_ATTENTION      = 4           # порог ВНИМАНИЕ
-SWING_ATTENTION_PCT  = 3.0         # % от Swing High/Low для ВНИМАНИЕ
+MIN_VOLUME_SIGNAL        = 5_000_000   # $5M для СИГНАЛ
+MIN_VOLUME_ATTENTION     = 1_000_000   # $1M для ВНИМАНИЕ и РАННИХ лонг/шорт 2H
+MIN_VOLUME_SQUEEZE       = 500_000     # $500K только для алерта СЖАТИЕ 2H  ← НОВОЕ
+MIN_RR_SIGNAL            = 3.0
+MIN_RR_ATTENTION         = 2.0
+MIN_TARGET_PCT_SIGNAL    = 5.0
+MIN_TARGET_PCT_ATTENTION = 2.0
+MAX_STOP_PCT             = 3.0
+SCORE_SIGNAL             = 7
+SCORE_ATTENTION          = 4
+SWING_ATTENTION_PCT      = 3.0
+
+SWING_BARS_2H            = 5           # ← НОВОЕ: было 10, стало 5 для 2H ранних сигналов
 
 bot_status = {
     "started_at":       datetime.now().isoformat(),
@@ -61,14 +64,6 @@ bot_status = {
 oi_cache: dict = {}
 
 
-# ─────────────────────────────────────────────
-# SSMA (Smoothed Moving Average)
-# period=24, source=(H+L+C)/3
-# ГЛАВНЫЕ ВОРОТА направления торговли:
-#   Лонг: цена > SSMA ИЛИ slope > 0
-#   Шорт: цена < SSMA ИЛИ slope < 0
-#   Оба условия нарушены = сигнал заблокирован
-# ─────────────────────────────────────────────
 def calculate_ssma(ohlcv, period=24):
     if len(ohlcv) < period + 10:
         return None, 'neutral', 0.0
@@ -99,27 +94,14 @@ def calculate_ssma(ohlcv, period=24):
 
 
 def ssma_allows_long(ssma_val, ssma_trend, ssma_slope, current_price):
-    """
-    SSMA ворота для лонга.
-    Разрешён если: цена выше SSMA ИЛИ SSMA растёт.
-    Заблокирован если: цена НИЖЕ SSMA И SSMA падает.
-    """
     if ssma_val is None:
-        return True  # нет данных — не блокируем
+        return True
     price_above = current_price > ssma_val
     ssma_rising = ssma_slope > 0
     return price_above or ssma_rising
 
 
 def ssma_allows_short(ssma_val, ssma_trend, ssma_slope, current_price):
-    """
-    SSMA ворота для шорта — ужесточённые.
-    Разрешён если:
-      (цена ниже SSMA И SSMA падает)
-      ИЛИ SSMA падает сильно (slope < -0.05%/св)
-    Блокирован если:
-      цена чуть ниже SSMA но SSMA ещё растёт (случай NEAR)
-    """
     if ssma_val is None:
         return True
     price_below  = current_price < ssma_val
@@ -128,11 +110,6 @@ def ssma_allows_short(ssma_val, ssma_trend, ssma_slope, current_price):
     return (price_below and ssma_falling) or strong_fall
 
 
-# ─────────────────────────────────────────────
-# R/R ФИЛЬТР
-# Цель минимум target_pct%, стоп максимум MAX_STOP_PCT%
-# Возвращает (passed, target_pct_actual, stop_pct_actual, rr_actual)
-# ─────────────────────────────────────────────
 def check_rr(current_price, target, stop, mode='long',
              min_target_pct=MIN_TARGET_PCT_SIGNAL,
              max_stop_pct=MAX_STOP_PCT):
@@ -158,27 +135,15 @@ def check_rr(current_price, target, stop, mode='long',
     return passed, target_pct, stop_pct, rr
 
 
-# ─────────────────────────────────────────────
-# ОБЪЁМ — расширенная информация
-# ─────────────────────────────────────────────
 def get_volume_info(closed, volume_24h):
-    """
-    Возвращает расширенный блок информации об объёме:
-    - Относительный объём (x от нормы)
-    - Z-score
-    - Примерное соотношение покупок/продаж (по дисбалансу свечей)
-    - 24H объём в $M
-    """
     v_history = [x[5] for x in closed[-21:-1]]
     v_avg     = np.mean(v_history) if v_history else 1.0
     v_cur     = closed[-1][5]
     v_rel     = v_cur / v_avg if v_avg > 0 else 1.0
 
-    # Z-score
     std = np.std(v_history) if len(v_history) > 1 else 1.0
     v_zscore = (v_cur - np.mean(v_history)) / std if std > 0 else 0.0
 
-    # Соотношение покупок/продаж по последним 5 свечам
     buy_pct_list = []
     for c in closed[-5:]:
         h, l, cl = c[2], c[3], c[4]
@@ -211,9 +176,6 @@ def get_volume_info(closed, volume_24h):
     return vol_score, vol_label, v_rel, v_zscore, avg_buy_pct, detail_block
 
 
-# ─────────────────────────────────────────────
-# BB OUTSIDE ATR
-# ─────────────────────────────────────────────
 def calculate_bb_outside_atr(ohlcv, bb_length=55, bb_std=0.712,
                                atr_length=20, atr_mult=0.618,
                                tilson_length=10, tilson_factor=0.3):
@@ -274,9 +236,6 @@ def calculate_bb_outside_atr(ohlcv, bb_length=55, bb_std=0.712,
         return 'neutral', 0.0, upper, lower, basis
 
 
-# ─────────────────────────────────────────────
-# SWING HILO (34 bars)
-# ─────────────────────────────────────────────
 def calculate_swing_hilo(ohlcv, swing_bars=34):
     if len(ohlcv) < swing_bars * 2 + 1:
         return 100.0, 100.0, False, False, None, None
@@ -307,43 +266,7 @@ def calculate_swing_hilo(ohlcv, swing_bars=34):
     return sw_low_pct, sw_high_pct, near_sw_low, near_sw_high, last_sw_low, last_sw_high
 
 
-# ─────────────────────────────────────────────
-# ЭЛЛИОТТ ВОЛНЫ + ФИБОНАЧЧИ
-#
-# Алгоритм:
-# 1. Собираем все свинг-точки (HILO с lookback=10)
-# 2. Определяем структуру: бычья / медвежья / боковая
-# 3. Считаем Фибо откат текущей коррекции
-# 4. Определяем предположительный номер волны
-# 5. Считаем цели расширения (1.618, 2.618)
-# 6. Проверяем BOS (Break of Structure)
-#
-# Возвращает словарь со всей информацией
-# ─────────────────────────────────────────────
 def analyze_elliott(ohlcv, swing_bars=10):
-    """
-    Анализ волн Эллиотта на 4H.
-
-    Возвращает dict:
-      structure:     'bullish' / 'bearish' / 'neutral'
-      wave_number:   1-5 или 'A'/'B'/'C' или None
-      wave_label:    читаемое описание
-      fib_retracement: процент отката (0-100)
-      fib_level:     ближайший уровень Фибо (0.382/0.5/0.618)
-      fib_on_level:  True если цена на уровне Фибо ±1%
-      wave1_low:     начало волны 1
-      wave1_high:    конец волны 1 (= начало волны 2)
-      fib_382/500/618: уровни поддержки/сопротивления
-      ext_1618:      цель волны 3 (1.618 расширение)
-      ext_2618:      цель волны 3 (2.618 расширение)
-      bos_bull:      True = пробой предыдущего хая (бычий BOS)
-      bos_bear:      True = пробой предыдущего лоя (медвежий BOS)
-      score_long:    бонус к скору лонга (0-4)
-      score_short:   бонус к скору шорта (0-4)
-      details_long:  список строк для алерта лонг
-      details_short: список строк для алерта шорт
-      alert_block:   готовый блок текста для алерта
-    """
     result = {
         'structure': 'neutral', 'wave_number': None, 'wave_label': '⚪️ Нет данных',
         'fib_retracement': 0.0, 'fib_level': None, 'fib_on_level': False,
@@ -364,8 +287,7 @@ def analyze_elliott(ohlcv, swing_bars=10):
     closes = [c[4] for c in ohlcv]
     n      = len(ohlcv)
 
-    # ── Собираем свинг-точки ──────────────────
-    swing_lows  = []  # (index, price)
+    swing_lows  = []
     swing_highs = []
 
     for i in range(swing_bars, n - swing_bars):
@@ -377,15 +299,11 @@ def analyze_elliott(ohlcv, swing_bars=10):
     if len(swing_lows) < 2 or len(swing_highs) < 2:
         return result
 
-    # Последние 3 свинга каждого типа
     last_lows  = swing_lows[-3:]
     last_highs = swing_highs[-3:]
 
     current = closes[-1]
 
-    # ── Определяем структуру ─────────────────
-    # Бычья: каждый следующий лой выше предыдущего
-    #        каждый следующий хай выше предыдущего
     bull_lows  = all(last_lows[i][1]  < last_lows[i+1][1]  for i in range(len(last_lows)-1))
     bull_highs = all(last_highs[i][1] < last_highs[i+1][1] for i in range(len(last_highs)-1))
     bear_lows  = all(last_lows[i][1]  > last_lows[i+1][1]  for i in range(len(last_lows)-1))
@@ -396,32 +314,23 @@ def analyze_elliott(ohlcv, swing_bars=10):
     elif bear_lows and bear_highs:
         result['structure'] = 'bearish'
     elif bull_lows and not bull_highs:
-        result['structure'] = 'bullish'  # лои растут = основной сигнал
+        result['structure'] = 'bullish'
     elif bear_highs and not bear_lows:
         result['structure'] = 'bearish'
     else:
         result['structure'] = 'neutral'
 
-    # ── BOS (Break of Structure) ──────────────
-    # Бычий BOS: текущая цена пробила предпоследний swing high
     if len(swing_highs) >= 2:
         prev_high = swing_highs[-2][1]
         result['bos_bull'] = current > prev_high
 
-    # Медвежий BOS: текущая цена пробила предпоследний swing low
     if len(swing_lows) >= 2:
         prev_low = swing_lows[-2][1]
         result['bos_bear'] = current < prev_low
 
-    # ── Фибоначчи расчёт ─────────────────────
-    # Берём последний значимый импульс:
-    # для бычьей структуры: от последнего swing low до последнего swing high
-    # для медвежьей: от последнего swing high до последнего swing low
-
     if result['structure'] == 'bullish':
-        # Последний импульс вверх
-        w1_low  = swing_lows[-2][1]   # начало импульса (волна 1 старт)
-        w1_high = swing_highs[-1][1]  # конец импульса (волна 1 финиш)
+        w1_low  = swing_lows[-2][1]
+        w1_high = swing_highs[-1][1]
         impulse = w1_high - w1_low
 
         if impulse <= 0:
@@ -430,22 +339,18 @@ def analyze_elliott(ohlcv, swing_bars=10):
         result['wave1_low']  = w1_low
         result['wave1_high'] = w1_high
 
-        # Уровни Фибо (поддержки при коррекции)
         result['fib_382'] = w1_high - impulse * 0.382
         result['fib_500'] = w1_high - impulse * 0.500
         result['fib_618'] = w1_high - impulse * 0.618
 
-        # Цели расширения волны 3
         result['ext_1618'] = w1_low + impulse * 1.618
         result['ext_2618'] = w1_low + impulse * 2.618
 
-        # Текущий откат от хая
         if current < w1_high:
             retrace = (w1_high - current) / impulse * 100
             result['fib_retracement'] = retrace
 
-            # Определяем на каком уровне Фибо цена
-            tolerance = 0.015  # ±1.5% от уровня
+            tolerance = 0.015
             for lvl_name, lvl_val in [('61.8%', result['fib_618']),
                                        ('50.0%', result['fib_500']),
                                        ('38.2%', result['fib_382'])]:
@@ -454,18 +359,13 @@ def analyze_elliott(ohlcv, swing_bars=10):
                     result['fib_on_level'] = True
                     break
 
-            # ── Определяем номер волны ───────
             if retrace <= 38.2:
-                # Небольшой откат — возможно волна 4
                 result['wave_number'] = 4
                 result['wave_label']  = '〽️ Волна 4 (откат, ждём 5)'
             elif 38.2 < retrace <= 61.8:
-                # Классический откат волны 2
                 result['wave_number'] = 2
                 result['wave_label']  = '〽️ Волна 2 → ожидается Волна 3 ⚡️'
             elif retrace > 61.8:
-                # Глубокий откат — или волна 2 расширенная
-                # или смена тренда
                 if retrace <= 78.6:
                     result['wave_number'] = 2
                     result['wave_label']  = '〽️ Волна 2 глубокая (78.6%)'
@@ -473,8 +373,6 @@ def analyze_elliott(ohlcv, swing_bars=10):
                     result['wave_number'] = None
                     result['wave_label']  = '⚠️ Возможная смена тренда'
         else:
-            # Цена выше хая = импульс продолжается
-            # Проверяем: это волна 3?
             ext_pct = (current - w1_low) / impulse * 100
             if 100 < ext_pct <= 162:
                 result['wave_number'] = 3
@@ -487,7 +385,6 @@ def analyze_elliott(ohlcv, swing_bars=10):
                 result['wave_label']  = '〽️ Волна 1 (начало)'
 
     elif result['structure'] == 'bearish':
-        # Последний импульс вниз
         w1_high = swing_highs[-2][1]
         w1_low  = swing_lows[-1][1]
         impulse = w1_high - w1_low
@@ -498,12 +395,10 @@ def analyze_elliott(ohlcv, swing_bars=10):
         result['wave1_low']  = w1_low
         result['wave1_high'] = w1_high
 
-        # Фибо для медвежьего (сопротивления при отскоке)
         result['fib_382'] = w1_low + impulse * 0.382
         result['fib_500'] = w1_low + impulse * 0.500
         result['fib_618'] = w1_low + impulse * 0.618
 
-        # Цели расширения вниз
         result['ext_1618'] = w1_high - impulse * 1.618
         result['ext_2618'] = w1_high - impulse * 2.618
 
@@ -545,13 +440,10 @@ def analyze_elliott(ohlcv, swing_bars=10):
                 result['wave_number'] = 1
                 result['wave_label']  = '〽️ Волна 1↓ (начало)'
 
-    # ── Скоринг и детали ─────────────────────
     sc_l = 0; sc_s = 0; det_l = []; det_s = []
 
-    # ЛОНГ бонусы
     if result['structure'] == 'bullish':
         if result['wave_number'] == 2 and result['fib_on_level']:
-            # Лучший вход: волна 2 на Фибо = начало волны 3
             sc_l += 3
             det_l.append(f"⚡️ W2→W3 Фибо {result['fib_level']}")
         elif result['wave_number'] == 2:
@@ -567,7 +459,6 @@ def analyze_elliott(ohlcv, swing_bars=10):
             sc_l += 1
             det_l.append("💥 BOS пробой")
 
-    # ШОРТ бонусы
     if result['structure'] == 'bearish':
         if result['wave_number'] == 2 and result['fib_on_level']:
             sc_s += 3
@@ -585,19 +476,14 @@ def analyze_elliott(ohlcv, swing_bars=10):
             sc_s += 1
             det_s.append("💥 BOS пробой вниз")
 
-    # ── Проверка слома структуры (ABC коррекция) ──
-    # Правило Эллиотта: если цена ушла ниже начала
-    # предполагаемой Волны 3 (= ниже wave1_low в бычьей структуре)
-    # → это не Волна 2, а ABC коррекция → блокируем лонг
     if (result['structure'] == 'bullish'
             and result['wave1_low'] is not None
             and closes[-1] < result['wave1_low'] * 0.99):
         result['wave_label']  = '⚠️ ABC коррекция (структура сломана)'
         result['wave_number'] = None
-        sc_l = 0   # обнуляем лонг-скор — не входим
+        sc_l = 0
         det_l = ['⚠️ ABC — ждём завершения коррекции']
 
-    # Аналогично для медвежьей: цена выше wave1_high = слом вниз
     if (result['structure'] == 'bearish'
             and result['wave1_high'] is not None
             and closes[-1] > result['wave1_high'] * 1.01):
@@ -611,7 +497,6 @@ def analyze_elliott(ohlcv, swing_bars=10):
     result['details_long'] = det_l
     result['details_short']= det_s
 
-    # ── Блок для алерта ──────────────────────
     lines = []
     lines.append(f"〽️ Эллиотт: <b>{result['wave_label']}</b>")
 
@@ -636,7 +521,6 @@ def analyze_elliott(ohlcv, swing_bars=10):
             f"61.8%={result['fib_618']:.4g}"
         )
         if result['ext_1618']:
-            w1_low = result['wave1_low']
             lines.append(
                 f"🎯 Цели W3: ×1.618={result['ext_1618']:.4g} "
                 f"(+{(result['ext_1618']/result['wave1_high']-1)*100:.1f}%) | "
@@ -664,9 +548,6 @@ def analyze_elliott(ohlcv, swing_bars=10):
     return result
 
 
-# ─────────────────────────────────────────────
-# WYCKOFF ФАЗЫ
-# ─────────────────────────────────────────────
 def detect_wyckoff_phase(ohlcv, swing_low, swing_high, cvd_level):
     if len(ohlcv) < 60:
         return 'ranging', True, True, '⚪️ Диапазон', 0
@@ -697,7 +578,6 @@ def detect_wyckoff_phase(ohlcv, swing_low, swing_high, cvd_level):
     ma20_end    = np.mean(closes[-5:])
     trend_20    = (ma20_end - ma20_start) / ma20_start * 100
 
-    # Spring
     recent_lows  = [c[3] for c in ohlcv[-5:]]
     spring_detected = (min(recent_lows) < swing_low * 1.005
                        and current > swing_low * 1.01
@@ -705,7 +585,6 @@ def detect_wyckoff_phase(ohlcv, swing_low, swing_high, cvd_level):
     if spring_detected:
         return 'accumulation', True, False, '🌱 Spring (Wyckoff)', 3
 
-    # UTAD
     recent_highs = [c[2] for c in ohlcv[-5:]]
     utad_detected = (max(recent_highs) > swing_high * 0.995
                      and current < swing_high * 0.99
@@ -713,7 +592,6 @@ def detect_wyckoff_phase(ohlcv, swing_low, swing_high, cvd_level):
     if utad_detected:
         return 'distribution', False, True, '🔝 UTAD (Wyckoff)', 3
 
-    # Accumulation
     if (position_pct <= 25
             and vol_at_lows > vol_avg * 1.2
             and cvd_level in ('bull', 'bull_div')
@@ -724,7 +602,6 @@ def detect_wyckoff_phase(ohlcv, swing_low, swing_high, cvd_level):
         if cvd_level == 'bull_div':   strength += 1
         return 'accumulation', True, False, '🟢 Накопление (Wyckoff)', min(strength, 3)
 
-    # Distribution
     if (position_pct >= 75
             and vol_at_highs > vol_avg * 1.2
             and cvd_level in ('bear', 'bear_div')
@@ -735,20 +612,15 @@ def detect_wyckoff_phase(ohlcv, swing_low, swing_high, cvd_level):
         if cvd_level == 'bear_div':    strength += 1
         return 'distribution', False, True, '🔴 Распределение (Wyckoff)', min(strength, 3)
 
-    # Markup
     if trend_20 > 3.0 and position_pct > 50 and cvd_level in ('bull', 'bull_div'):
         return 'markup', True, False, '📈 Разгон (Markup)', 1
 
-    # Markdown
     if trend_20 < -3.0 and position_pct < 50 and cvd_level in ('bear', 'bear_div'):
         return 'markdown', False, True, '📉 Снижение (Markdown)', 1
 
     return 'ranging', True, True, '⚪️ Диапазон', 0
 
 
-# ─────────────────────────────────────────────
-# ФИЛЬТР ПОСЛЕ БОЛЬШОГО ДВИЖЕНИЯ
-# ─────────────────────────────────────────────
 def check_post_move_filter(ohlcv, lookback=12):
     if len(ohlcv) < lookback + 1:
         return False, False, 0.0, 0
@@ -779,9 +651,6 @@ def check_post_move_filter(ohlcv, lookback=12):
     return after_dump, after_pump, move_pct, candles_since
 
 
-# ─────────────────────────────────────────────
-# CVD
-# ─────────────────────────────────────────────
 def calc_cvd_level(closed):
     if len(closed) < 10:
         return 'neutral', 0.0
@@ -829,9 +698,6 @@ def get_cvd_divergence(ohlcv, mode='long'):
                 and cvd_proxy[-1] < max(cvd_proxy[-lookback:-1]))
 
 
-# ─────────────────────────────────────────────
-# RSI ДИВЕРГЕНЦИЯ
-# ─────────────────────────────────────────────
 def calc_rsi_divergence(closed, rsi_period=14, lookback=10):
     closes = [x[4] for x in closed]
     if len(closes) < rsi_period + lookback + 2:
@@ -860,9 +726,6 @@ def calc_rsi_divergence(closed, rsi_period=14, lookback=10):
     return bull, bear
 
 
-# ─────────────────────────────────────────────
-# OI
-# ─────────────────────────────────────────────
 def get_oi_data_from_ticker(symbol, tickers, price_change_pct):
     try:
         ticker   = tickers.get(symbol)
@@ -894,9 +757,6 @@ def get_oi_data_from_ticker(symbol, tickers, price_change_pct):
         return 0.0, 'neutral', '⚪️ OI: нет данных'
 
 
-# ─────────────────────────────────────────────
-# ФАНДИНГ
-# ─────────────────────────────────────────────
 def get_funding_signal(symbol):
     try:
         fr   = exchange.fetch_funding_rate(symbol)
@@ -908,9 +768,6 @@ def get_funding_signal(symbol):
         return 0.0, 'neutral', '⚪️ Фандинг: нет данных'
 
 
-# ─────────────────────────────────────────────
-# PIVOT УРОВНИ
-# ─────────────────────────────────────────────
 def get_pivot_levels(ohlcv, tolerance=0.005):
     highs = [x[2] for x in ohlcv]; lows = [x[3] for x in ohlcv]
     pl = []; ph = []
@@ -932,9 +789,6 @@ def get_pivot_levels(ohlcv, tolerance=0.005):
             sorted([r for r in cluster(ph, tolerance) if r > cp]))
 
 
-# ─────────────────────────────────────────────
-# ATR
-# ─────────────────────────────────────────────
 def calculate_atr(ohlcv, period=14):
     if len(ohlcv) < period + 1: return None
     trs = [max(ohlcv[i][2]-ohlcv[i][3],
@@ -954,9 +808,6 @@ def dynamic_atr_multipliers(btc_vol):
     return sk, tk, f"1:{tk/sk:.1f}"
 
 
-# ─────────────────────────────────────────────
-# MFI
-# ─────────────────────────────────────────────
 def calculate_mfi(ohlcv, period=14):
     if len(ohlcv) < period + 1: return 50.0
     tp_prev = None; pos_mf = []; neg_mf = []
@@ -973,9 +824,6 @@ def calculate_mfi(ohlcv, period=14):
     return 100.0 - (100.0 / (1.0 + pmf / nmf))
 
 
-# ─────────────────────────────────────────────
-# RSI WILDER
-# ─────────────────────────────────────────────
 def calculate_rsi_wilder(closes, period=14):
     if len(closes) < period + 1: return 50.0
     d  = np.diff(closes)
@@ -988,9 +836,6 @@ def calculate_rsi_wilder(closes, period=14):
     return 100.0 - (100.0 / (1.0 + ag / al))
 
 
-# ─────────────────────────────────────────────
-# DEMARK TD
-# ─────────────────────────────────────────────
 def update_td_counters(ohlcv, mode='long'):
     closed = ohlcv[:-1]
     closes = [x[4] for x in closed]; lows = [x[3] for x in closed]; highs = [x[2] for x in closed]
@@ -1044,9 +889,6 @@ def update_td_counters(ohlcv, mode='long'):
     return m9_signal, m9_perfect, m13_signal
 
 
-# ─────────────────────────────────────────────
-# МОЛОТ
-# ─────────────────────────────────────────────
 def check_hammer(ohlcv, mode='long'):
     if len(ohlcv) < 2: return False
     o, h, l, c = ohlcv[-2][1], ohlcv[-2][2], ohlcv[-2][3], ohlcv[-2][4]
@@ -1057,9 +899,6 @@ def check_hammer(ohlcv, mode='long'):
         return (h - max(o,c)) / fr > 0.6 and body / fr < 0.3
 
 
-# ─────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНЫЕ
-# ─────────────────────────────────────────────
 def build_tv_link(symbol):
     tv = symbol.replace('/', '').replace(':USDT', '.P')
     return f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>"
@@ -1103,26 +942,7 @@ def adaptive_threshold(base, btc_vol, is_priority):
     return max(t, 3)
 
 
-
-# ─────────────────────────────────────────────
-# СЖАТИЕ ВОЛАТИЛЬНОСТИ (Volatility Squeeze)
-# Свечи маленькие + боковик + наклон вверх = готов к взрыву
-#
-# Логика:
-#   ATR compression: recent_atr / avg_atr < 0.6
-#   Inside bars:     последние N свечей в диапазоне предыдущей
-#   Наклон:          цена слегка растёт (slope > 0)
-# ─────────────────────────────────────────────
 def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
-    """
-    Определяет сжатие волатильности перед взрывом.
-    Возвращает:
-      is_squeeze:   True если сжатие есть
-      squeeze_ratio: current_atr / avg_atr (чем меньше, тем сильнее сжатие)
-      slope_pct:    наклон цены за period свечей (+ = вверх)
-      bars_count:   сколько свечей подряд в сжатии
-      label:        строка для алерта
-    """
     if len(ohlcv) < avg_period + period + 1:
         return False, 1.0, 0.0, 0, ""
 
@@ -1130,7 +950,6 @@ def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
     highs  = [c[2] for c in ohlcv]
     lows   = [c[3] for c in ohlcv]
 
-    # ATR за последние period свечей (текущее сжатие)
     def calc_atr_range(start, end):
         trs = []
         for i in range(start + 1, end):
@@ -1146,10 +965,9 @@ def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
 
     squeeze_ratio = recent_atr / avg_atr
 
-    # Наклон цены за последние period свечей
-    slope_pct = (closes[-1] - closes[-period - 1]) / closes[-period - 1] * 100                 if closes[-period - 1] > 0 else 0.0
+    slope_pct = (closes[-1] - closes[-period - 1]) / closes[-period - 1] * 100 \
+                if closes[-period - 1] > 0 else 0.0
 
-    # Считаем сколько свечей подряд меньше средней ATR
     bars_count = 0
     for i in range(len(ohlcv) - 1, len(ohlcv) - period - 1, -1):
         if i < 1: break
@@ -1159,13 +977,11 @@ def detect_volatility_squeeze(ohlcv, period=5, avg_period=20):
         else:
             break
 
-    # Сжатие: ATR < 60% от среднего + минимум 3 свечи подряд
     is_squeeze = squeeze_ratio < 0.6 and bars_count >= 3
 
     if not is_squeeze:
         return False, squeeze_ratio, slope_pct, bars_count, ""
 
-    # Определяем направление наклона
     if slope_pct > 0.5:
         direction = "↗️ наклон вверх"
     elif slope_pct < -0.5:
@@ -1185,22 +1001,6 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
                             range_window=20, noise_window=10,
                             containment_window=20,
                             compression_threshold=60, mature_threshold=80):
-    """
-    Сжатие по методике ATR Map — 4-компонентный скор.
-
-    Компоненты:
-      1. ATR Score (вес 30)        — текущий ATR vs baseline ATR
-      2. Range Score (вес 30)      — текущий диапазон vs средний за range_window
-      3. Noise Score (вес 20)      — соотношение тела свечи к полному диапазону
-      4. Containment Score (вес 20)— свечи содержатся внутри предыдущих
-
-    Возвращает:
-      total_score (0-100)
-      is_forming   (score >= 60)
-      is_mature    (score >= 80)
-      label        — описание для алерта
-      components   — детализация по компонентам
-    """
     if len(ohlcv) < baseline_length + 5:
         return 0, False, False, "", {}
 
@@ -1209,8 +1009,6 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
     highs  = [c[2] for c in ohlcv]
     lows   = [c[3] for c in ohlcv]
 
-    # ── 1. ATR Score ───────────────────────────
-    # Текущий ATR (последние atr_length свечей) vs baseline
     def atr_calc(start, end):
         trs = []
         for i in range(max(start, 1), end):
@@ -1228,11 +1026,8 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
         return 0, False, False, "", {}
 
     atr_ratio = current_atr / baseline_atr
-    # Чем меньше ratio — тем сильнее сжатие, скор выше
     atr_score = max(0, min(100, (1.0 - atr_ratio) * 200))
 
-    # ── 2. Range Score ─────────────────────────
-    # Средний диапазон последних N свечей vs средний за длинный период
     recent_ranges  = [highs[i] - lows[i] for i in range(n - range_window, n)]
     long_ranges    = [highs[i] - lows[i] for i in range(n - baseline_length, n - range_window)]
     avg_recent     = np.mean(recent_ranges) if recent_ranges else 0.0
@@ -1244,8 +1039,6 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
         range_ratio = avg_recent / avg_long
         range_score = max(0, min(100, (1.0 - range_ratio) * 200))
 
-    # ── 3. Noise Score ─────────────────────────
-    # Соотношение тела к диапазону — маленькие тела = шум = сжатие
     body_ratios = []
     for i in range(n - noise_window, n):
         full_range = highs[i] - lows[i]
@@ -1253,11 +1046,8 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
         if full_range > 0:
             body_ratios.append(body / full_range)
     avg_body_ratio = np.mean(body_ratios) if body_ratios else 1.0
-    # Чем меньше body_ratio (больше фитилей) — тем больше шума
     noise_score = max(0, min(100, (1.0 - avg_body_ratio) * 150))
 
-    # ── 4. Containment Score ───────────────────
-    # Свеча содержится внутри предыдущей: high <= prev_high И low >= prev_low
     contained_count = 0
     for i in range(n - containment_window, n):
         if i < 1: continue
@@ -1265,7 +1055,6 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
             contained_count += 1
     containment_score = (contained_count / containment_window) * 100
 
-    # ── Взвешенный итоговый скор ───────────────
     total_score = (atr_score * 0.30 +
                    range_score * 0.30 +
                    noise_score * 0.20 +
@@ -1301,9 +1090,9 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
 # ОСНОВНОЙ ЦИКЛ
 # ─────────────────────────────────────────────
 def analyst_loop():
-    sent_signals = {}   # key → timestamp (СИГНАЛ)
-    sent_attention = {} # key → timestamp (ВНИМАНИЕ)
-    logging.info("Аналитик v6.0 запущен.")
+    sent_signals = {}
+    sent_attention = {}
+    logging.info("Аналитик v6.1 запущен.")
 
     try:
         exchange.load_markets()
@@ -1336,17 +1125,15 @@ def analyst_loop():
                  for s in active_swaps if s in tickers],
                 key=lambda x: x['v'], reverse=True)
 
-            # 4H: топ 100 монет — жёсткие фильтры, нужны только ликвидные
             top100_4h = [x['s'] for x in vol_data[:100]]
             symbols   = list(dict.fromkeys(
                 [w for w in WATCHLIST if w in tickers] + top100_4h))
 
             for symbol in symbols:
                 try:
-                    # ── Фильтр объёма монеты ──
                     vol_24h = tickers.get(symbol, {}).get('quoteVolume', 0) or 0
                     if vol_24h < MIN_VOLUME_ATTENTION:
-                        continue  # меньше $2M — пропускаем совсем
+                        continue
 
                     ohlcv = None
                     for attempt in range(2):
@@ -1367,8 +1154,8 @@ def analyst_loop():
                     candle_id      = last_closed_ts // 14_400_000
                     l_key  = f"{symbol}_{candle_id}_l"
                     s_key  = f"{symbol}_{candle_id}_s"
-                    la_key = f"{symbol}_{candle_id}_la"  # attention long
-                    sa_key = f"{symbol}_{candle_id}_sa"  # attention short
+                    la_key = f"{symbol}_{candle_id}_la"
+                    sa_key = f"{symbol}_{candle_id}_sa"
 
                     all_done = (l_key in sent_signals and s_key in sent_signals
                                 and la_key in sent_attention and sa_key in sent_attention)
@@ -1378,9 +1165,6 @@ def analyst_loop():
                     price_ch = ((closed[-1][4] - closed[-2][4]) / closed[-2][4] * 100) \
                                if len(closed) >= 2 else 0.0
 
-                    # ══════════════════════════════
-                    # ИНДИКАТОРЫ
-                    # ══════════════════════════════
                     rsi = calculate_rsi_wilder(closes_closed)
                     mfi = calculate_mfi(closed)
                     atr = calculate_atr(closed)
@@ -1389,42 +1173,32 @@ def analyst_loop():
                     buy_pressure = (c_close - c_low) / (c_high - c_low) if c_high != c_low else 0.5
                     imb = (buy_pressure - 0.5) * 200
 
-                    # Объём расширенный
                     vol_score, vol_label, v_rel, v_zscore, avg_buy_pct, vol_detail = \
                         get_volume_info(closed, vol_24h)
 
-                    # ── SSMA — ГЛАВНЫЕ ВОРОТА ──
                     ssma_val, ssma_trend, ssma_slope = calculate_ssma(closed, period=24)
                     long_gate  = ssma_allows_long(ssma_val, ssma_trend, ssma_slope, current_price)
                     short_gate = ssma_allows_short(ssma_val, ssma_trend, ssma_slope, current_price)
 
-                    # ── Анализ незакрытой свечи (инtrabar) ──
-                    # Смотрим на текущую незакрытую свечу
-                    # Если цена откатила >3% от внутридневного хая = потенциальный разворот вниз
-                    # Если цена выросла >3% от внутридневного лоя = потенциальный разворот вверх
                     cur_candle    = ohlcv[-1]
                     intrabar_high = cur_candle[2]
                     intrabar_low  = cur_candle[3]
                     intrabar_open = cur_candle[1]
 
-                    # Откат от внутридневного хая
-                    intrabar_pullback = (intrabar_high - current_price) / intrabar_high * 100                                         if intrabar_high > 0 else 0.0
-                    # Рост от внутридневного лоя
-                    intrabar_bounce   = (current_price - intrabar_low) / intrabar_low * 100                                         if intrabar_low > 0 else 0.0
+                    intrabar_pullback = (intrabar_high - current_price) / intrabar_high * 100 \
+                                        if intrabar_high > 0 else 0.0
+                    intrabar_bounce   = (current_price - intrabar_low) / intrabar_low * 100 \
+                                        if intrabar_low > 0 else 0.0
 
-                    # Объём текущей свечи vs средний
                     v_avg_cur = np.mean([x[5] for x in closed[-20:]]) if len(closed) >= 20 else 1.0
                     cur_vol_rel = cur_candle[5] / v_avg_cur if v_avg_cur > 0 else 1.0
 
-                    # Разворот у хая: откат >1.5% + объём x1.2+ = ранний шорт-сигнал
-                    # Порог снижен: 4H свеча редко даёт 2.5% отката внутри
                     intrabar_top_reversal = (
                         intrabar_pullback >= 1.5
                         and cur_vol_rel >= 1.2
                         and current_price < intrabar_high * 0.985
                         and short_gate
                     )
-                    # Разворот у лоя: отскок >1.5% + объём x1.2+ = ранний лонг-сигнал
                     intrabar_bottom_reversal = (
                         intrabar_bounce >= 1.5
                         and cur_vol_rel >= 1.2
@@ -1432,40 +1206,33 @@ def analyst_loop():
                         and long_gate
                     )
 
-                    # ── SSMA метка ──
                     ssma_label = ""
                     if ssma_val:
                         icon = "📈" if 'bull' in ssma_trend else "📉"
                         ssma_label = f"{icon} SSMA: {ssma_val:.4g} ({ssma_slope:+.2f}%/св)"
 
-                    # BB ATR
-                    bb_signal, bb_dist, bb_upper, bb_lower, bb_basis =                         calculate_bb_outside_atr(closed)
+                    bb_signal, bb_dist, bb_upper, bb_lower, bb_basis = \
+                        calculate_bb_outside_atr(closed)
 
-                    # Swing HILO
-                    sw_low_pct, sw_high_pct, near_sw_low, near_sw_high, sw_low, sw_high =                         calculate_swing_hilo(closed, swing_bars=20)
+                    sw_low_pct, sw_high_pct, near_sw_low, near_sw_high, sw_low, sw_high = \
+                        calculate_swing_hilo(closed, swing_bars=20)
 
-                    # CVD
                     cvd_level, cvd_total = calc_cvd_level(closed)
                     cvd_div_l = get_cvd_divergence(closed, 'long')
                     cvd_div_s = get_cvd_divergence(closed, 'short')
 
-                    # RSI дивергенция
                     rsi_div_bull, rsi_div_bear = calc_rsi_divergence(closed)
 
-                    # Молот
                     hammer_l = check_hammer(ohlcv, 'long')
                     hammer_s = check_hammer(ohlcv, 'short')
 
-                    # DeMark
                     m9_l, m9_perfect_l, m13_l = update_td_counters(ohlcv, 'long')
                     m9_s, m9_perfect_s, m13_s = update_td_counters(ohlcv, 'short')
 
-                    # Pivot
                     supports, resistances = get_pivot_levels(closed)
                     sup = supports[0]    if supports    else min(x[3] for x in closed[-60:])
                     res = resistances[0] if resistances else max(x[2] for x in closed[-60:])
 
-                    # ATR цели
                     stop_k, take_k, rr_str = dynamic_atr_multipliers(ctx['btc_vol'])
                     if atr:
                         stop_l = current_price - stop_k * atr
@@ -1475,11 +1242,11 @@ def analyst_loop():
                     else:
                         stop_l = stop_s = target_l = target_s = None
 
-                    # Wyckoff
-                    wyckoff_phase, wyckoff_long_ok, wyckoff_short_ok, wyckoff_label, wyckoff_strength =                         detect_wyckoff_phase(closed, sw_low or sup, sw_high or res, cvd_level)
+                    wyckoff_phase, wyckoff_long_ok, wyckoff_short_ok, wyckoff_label, wyckoff_strength = \
+                        detect_wyckoff_phase(closed, sw_low or sup, sw_high or res, cvd_level)
 
-                    # Фильтр после большого движения
-                    after_dump, after_pump, big_move_pct, candles_since_move =                         check_post_move_filter(ohlcv, lookback=12)
+                    after_dump, after_pump, big_move_pct, candles_since_move = \
+                        check_post_move_filter(ohlcv, lookback=12)
 
                     if after_dump and not wyckoff_long_ok:
                         wyckoff_long_ok  = True; wyckoff_short_ok = False
@@ -1488,10 +1255,8 @@ def analyst_loop():
                         wyckoff_short_ok = True; wyckoff_long_ok  = False
                         wyckoff_label    = f"🔝 После памп +{big_move_pct:.0f}%"
 
-                    # Эллиотт волны — два уровня
                     ew     = analyze_elliott(closed, swing_bars=10)
                     ew_big = analyze_elliott(closed, swing_bars=20)
-                    # Сжатие волатильности на 4H
                     is_sq_4h, sq_ratio_4h, sq_slope_4h, sq_bars_4h, sq_label_4h = \
                         detect_volatility_squeeze(closed, period=5, avg_period=20)
 
@@ -1506,16 +1271,12 @@ def analyst_loop():
                     else:
                         ew_big_label = ""
 
-                    # ── Исключения для SSMA ворот ──
-                    # Используем m9_l/m9_s которые теперь объявлены выше
-                    # ЗАКРЫТАЯ СВЕЧА: M9/M13 + BB oversold + vol x2 + near_sw
                     strong_reversal_l = (
                         (m9_l or m13_l)
                         and bb_signal == 'oversold'
                         and v_rel >= 2.0
                         and near_sw_low
                     )
-                    # НЕЗАКРЫТАЯ СВЕЧА: M9/M13 + отскок 2%+ + vol x1.5 + near_sw
                     strong_reversal_l_intrabar = (
                         (m9_l or m13_l)
                         and intrabar_bounce >= 2.0
@@ -1540,7 +1301,6 @@ def analyst_loop():
                     if strong_reversal_s or strong_reversal_s_intrabar:
                         short_gate = True
 
-                    # OI и фандинг
                     has_any = (cvd_div_l or cvd_div_s or hammer_l or hammer_s or
                                m9_l or m9_s or m13_l or m13_s or
                                rsi_div_bull or rsi_div_bear or vol_score >= 2 or
@@ -1557,13 +1317,9 @@ def analyst_loop():
                     wl_badge = " ⭐️" if is_wl else ""
                     cvd_emoji = {"bull":"🟢","bull_div":"🟢✨","bear":"🔴","bear_div":"🔴✨"}.get(cvd_level,"⚪️")
 
-                    # ══════════════════════════════════════════════════
-                    # ФУНКЦИЯ СКОРИНГА (общая для ВНИМАНИЕ и СИГНАЛ)
-                    # ══════════════════════════════════════════════════
                     def calc_score(mode):
                         score = 0; details = []
 
-                        # Wyckoff бонус
                         if mode == 'long':
                             if wyckoff_phase == 'accumulation' and wyckoff_strength >= 2:
                                 score += 2; details.append("🟢 Накопление")
@@ -1575,25 +1331,21 @@ def analyst_loop():
                             elif wyckoff_phase == 'distribution':
                                 score += 1; details.append("🔴 Распределение")
 
-                        # BB ATR
                         if mode == 'long' and bb_signal == 'oversold':
                             score += 2; details.append(f"📉 BB ATR Перепродан ({bb_dist:.1f}%)")
                         if mode == 'short' and bb_signal == 'overbought':
                             score += 2; details.append(f"📈 BB ATR Перекуплен ({bb_dist:.1f}%)")
 
-                        # Swing HILO
                         if mode == 'long' and near_sw_low:
                             score += 2; details.append(f"🏔️ Swing Low (+{sw_low_pct:.1f}%)")
                         if mode == 'short' and near_sw_high:
                             score += 2; details.append(f"🏔️ Swing High (-{sw_high_pct:.1f}%)")
 
-                        # SSMA бонус (не ворота — ворота выше)
                         if mode == 'long' and ssma_trend == 'bull_strong':
                             score += 1; details.append(f"📈 SSMA Бык ({ssma_slope:+.2f}%)")
                         if mode == 'short' and ssma_trend == 'bear_strong':
                             score += 1; details.append(f"📉 SSMA Медведь ({ssma_slope:+.2f}%)")
 
-                        # OI
                         if mode == 'long':
                             if oi_signal == 'bull':   score += 2; details.append(f"💹 OI +{oi_chg:.1f}%")
                             elif oi_signal == 'bear': score -= 1
@@ -1601,17 +1353,14 @@ def analyst_loop():
                             if oi_signal == 'bear':   score += 2; details.append(f"💹 OI +{oi_chg:.1f}%")
                             elif oi_signal == 'bull': score -= 1
 
-                        # CVD дивергенция
                         if mode == 'long' and cvd_div_l:
                             score += 2; details.append("🔥 CVD Дивер")
                         if mode == 'short' and cvd_div_s:
                             score += 2; details.append("🔥 CVD Дивер")
 
-                        # RSI дивергенция
                         if mode == 'long'  and rsi_div_bull: score += 2; details.append("📉 RSI Дивер")
                         if mode == 'short' and rsi_div_bear: score += 2; details.append("📈 RSI Дивер")
 
-                        # DeMark
                         if mode == 'long':
                             if m9_l:
                                 pts = 3 if m9_perfect_l else 2
@@ -1623,32 +1372,25 @@ def analyst_loop():
                                 score += pts; details.append("⏱ M9✨" if m9_perfect_s else "⏱ M9")
                             if m13_s: score += 3; details.append("⏱ M13")
 
-                        # CVD уровень
                         if mode == 'long'  and cvd_level in ('bull','bull_div'): score += 1; details.append("📍 CVD")
                         if mode == 'short' and cvd_level in ('bear','bear_div'): score += 1; details.append("📍 CVD")
 
-                        # Pivot
                         if mode == 'long'  and current_price <= sup * 1.015: score += 2; details.append("🧱 Pivot Sup")
                         if mode == 'short' and current_price >= res * 0.985: score += 2; details.append("🧱 Pivot Res")
 
-                        # Объём
                         if vol_score > 0: score += vol_score; details.append(vol_label)
 
-                        # Фандинг
                         if mode == 'long'  and fr_signal == 'bull': score += 1; details.append(f"💸 FR {fr_val:.3f}%")
                         if mode == 'short' and fr_signal == 'bear': score += 1; details.append(f"💸 FR {fr_val:.3f}%")
 
-                        # Молот
                         if mode == 'long'  and hammer_l: score += 1; details.append("⚓️ Фитиль")
                         if mode == 'short' and hammer_s: score += 1; details.append("🏹 Фитиль↑")
 
-                        # RSI/MFI экстремум
                         if mode == 'long'  and rsi < 30:  score += 1; details.append(f"📉 RSI {rsi:.0f}")
                         if mode == 'long'  and mfi < 20:  score += 1; details.append(f"💰 MFI {mfi:.0f}")
                         if mode == 'short' and rsi > 70:  score += 1; details.append(f"📈 RSI {rsi:.0f}")
                         if mode == 'short' and mfi > 80:  score += 1; details.append(f"💰 MFI {mfi:.0f}")
 
-                        # Эллиотт бонус
                         if mode == 'long'  and ew['score_long'] > 0:
                             score += ew['score_long']; details.extend(ew['details_long'])
                         if mode == 'short' and ew['score_short'] > 0:
@@ -1656,13 +1398,9 @@ def analyst_loop():
 
                         return max(score, 0), details
 
-                    # ══════════════════════════════════════════════════
-                    # INTRABAR — РАННИЕ СИГНАЛЫ (незакрытая свеча)
-                    # ══════════════════════════════════════════════════
                     ib_key_l = f"{symbol}_{candle_id}_ibl"
                     ib_key_s = f"{symbol}_{candle_id}_ibs"
 
-                    # Intrabar ЛОНГ — отскок от лоя свечи
                     if (ib_key_l not in sent_attention
                             and intrabar_bottom_reversal
                             and near_sw_low
@@ -1695,12 +1433,8 @@ def analyst_loop():
                             send_msg(msg)
                             sent_attention[ib_key_l] = time.time()
                             bot_status["attention_sent"] += 1
-                            logging.info(
-                                f"РАННИЙ ЛОНГ: {symbol} "
-                                f"bounce={intrabar_bounce:.1f}% vol=x{cur_vol_rel:.1f}"
-                            )
+                            logging.info(f"РАННИЙ ЛОНГ: {symbol} bounce={intrabar_bounce:.1f}% vol=x{cur_vol_rel:.1f}")
 
-                    # Intrabar ШОРТ — откат от хая свечи
                     if (ib_key_s not in sent_attention
                             and intrabar_top_reversal
                             and near_sw_high
@@ -1733,16 +1467,8 @@ def analyst_loop():
                             send_msg(msg)
                             sent_attention[ib_key_s] = time.time()
                             bot_status["attention_sent"] += 1
-                            logging.info(
-                                f"РАННИЙ ШОРТ: {symbol} "
-                                f"pullback={intrabar_pullback:.1f}% vol=x{cur_vol_rel:.1f}"
-                            )
+                            logging.info(f"РАННИЙ ШОРТ: {symbol} pullback={intrabar_pullback:.1f}% vol=x{cur_vol_rel:.1f}")
 
-                    # ══════════════════════════════════════════════════
-                    # ЛОНГ — ВНИМАНИЕ
-                    # Условие: цена в пределах 2% от Swing Low
-                    # SSMA ворота обязательны
-                    # ══════════════════════════════════════════════════
                     if (la_key not in sent_attention
                             and near_sw_low
                             and long_gate
@@ -1785,10 +1511,6 @@ def analyst_loop():
                             bot_status["attention_sent"] += 1
                             logging.info(f"ВНИМАНИЕ ЛОНГ: {symbol} score={a_score} sw_low={sw_low_pct:.1f}%")
 
-                    # ══════════════════════════════════════════════════
-                    # ШОРТ — ВНИМАНИЕ
-                    # Условие: цена в пределах 2% от Swing High
-                    # ══════════════════════════════════════════════════
                     if (sa_key not in sent_attention
                             and near_sw_high
                             and short_gate
@@ -1830,15 +1552,6 @@ def analyst_loop():
                             bot_status["attention_sent"] += 1
                             logging.info(f"ВНИМАНИЕ ШОРТ: {symbol} score={a_score} sw_high={sw_high_pct:.1f}%")
 
-                    # ══════════════════════════════════════════════════
-                    # ЛОНГ — СИГНАЛ
-                    # Дополнительно к ВНИМАНИЕ:
-                    #   - скор 7+
-                    #   - OI обязателен (bull или squeeze_dn)
-                    #   - R/R 3:1, цель 5%+, стоп макс 3%
-                    #   - объём $5M+
-                    #   - Wyckoff не диапазон
-                    # ══════════════════════════════════════════════════
                     if (l_key not in sent_signals
                             and long_gate
                             and wyckoff_long_ok
@@ -1846,24 +1559,16 @@ def analyst_loop():
                             and vol_24h >= MIN_VOLUME_SIGNAL):
 
                         score, details = calc_score('long')
-
-                        # OI обязателен для СИГНАЛ
                         oi_ok_l = oi_signal in ('bull', 'squeeze_dn')
-
-                        # R/R фильтр
                         rr_ok, tgt_pct, stp_pct, rr_val = check_rr(
                             current_price, target_l, stop_l, 'long',
                             MIN_TARGET_PCT_SIGNAL, MAX_STOP_PCT)
 
-                        # OI-ворота: без OI максимум 4
                         if not oi_ok_l and not (m13_l or cvd_div_l):
                             score = min(score, 4)
-
-                        # Wyckoff OI смягчение
                         if wyckoff_phase == 'accumulation' and not oi_ok_l:
                             score = min(score, 5)
 
-                        # ВЕТО
                         btc_red     = ctx['btc_trend'] == "🔴"
                         is_strong_l = oi_signal == 'bull' or m13_l or (v_rel > 5 and imb > 60)
                         veto_macro  = btc_red and not is_strong_l and not after_dump
@@ -1910,12 +1615,8 @@ def analyst_loop():
                             send_msg(msg)
                             sent_signals[l_key] = time.time()
                             bot_status["signals_sent"] += 1
-                            logging.info(f"СИГНАЛ ЛОНГ: {symbol} score={score} "
-                                         f"OI={oi_signal} RR={rr_val:.1f} tgt={tgt_pct:.1f}%")
+                            logging.info(f"СИГНАЛ ЛОНГ: {symbol} score={score} OI={oi_signal} RR={rr_val:.1f} tgt={tgt_pct:.1f}%")
 
-                    # ══════════════════════════════════════════════════
-                    # ШОРТ — СИГНАЛ
-                    # ══════════════════════════════════════════════════
                     if (s_key not in sent_signals
                             and short_gate
                             and wyckoff_short_ok
@@ -1923,9 +1624,7 @@ def analyst_loop():
                             and vol_24h >= MIN_VOLUME_SIGNAL):
 
                         score, details = calc_score('short')
-
                         oi_ok_s = oi_signal in ('bear', 'squeeze_up')
-
                         rr_ok, tgt_pct, stp_pct, rr_val = check_rr(
                             current_price, target_s, stop_s, 'short',
                             MIN_TARGET_PCT_SIGNAL, MAX_STOP_PCT)
@@ -1981,8 +1680,7 @@ def analyst_loop():
                             send_msg(msg)
                             sent_signals[s_key] = time.time()
                             bot_status["signals_sent"] += 1
-                            logging.info(f"СИГНАЛ ШОРТ: {symbol} score={score} "
-                                         f"OI={oi_signal} RR={rr_val:.1f} tgt={tgt_pct:.1f}%")
+                            logging.info(f"СИГНАЛ ШОРТ: {symbol} score={score} OI={oi_signal} RR={rr_val:.1f} tgt={tgt_pct:.1f}%")
 
                     time.sleep(0.15)
 
@@ -1994,38 +1692,36 @@ def analyst_loop():
                     logging.error(f"Ошибка {symbol}: {e}")
 
             # ══════════════════════════════════════════════════
-            # 2H СКАН — РАННИЕ СИГНАЛЫ + СЖАТИЕ ВОЛАТИЛЬНОСТИ
-            # Топ 100 монет по объёму, только РАННИЙ алерт
+            # 2H СКАН
             # ══════════════════════════════════════════════════
-            # 2H: топ 250 монет — мягкие фильтры, больше ранних сигналов
             top250_2h = [x['s'] for x in vol_data[:250]
-                         if tickers.get(x['s'], {}).get('quoteVolume', 0) >= MIN_VOLUME_ATTENTION]
+                         if tickers.get(x['s'], {}).get('quoteVolume', 0) >= MIN_VOLUME_SQUEEZE]
 
             for symbol in top250_2h:
                 try:
                     vol_24h_2h = tickers.get(symbol, {}).get('quoteVolume', 0) or 0
 
-                    ohlcv_2h = None
+                    ohlcv_raw_1h = None
                     for attempt in range(2):
                         try:
                             ohlcv_raw_1h = exchange.fetch_ohlcv(symbol, '1h', limit=160); break
                         except ccxt.NetworkError as e:
                             if attempt == 0: time.sleep(3)
                             else: raise
-                    # Конвертируем 1H → 2H: объединяем каждые 2 свечи
+
+                    ohlcv_2h = None
                     if ohlcv_raw_1h and len(ohlcv_raw_1h) >= 4:
                         ohlcv_2h = []
-                        # Берём чётные пары свечей (0+1, 2+3, ...)
                         for i in range(0, len(ohlcv_raw_1h) - 1, 2):
                             c1 = ohlcv_raw_1h[i]
                             c2 = ohlcv_raw_1h[i + 1]
                             merged = [
-                                c1[0],                      # timestamp (начало)
-                                c1[1],                      # open (первая свеча)
-                                max(c1[2], c2[2]),          # high
-                                min(c1[3], c2[3]),          # low
-                                c2[4],                      # close (вторая свеча)
-                                c1[5] + c2[5]               # volume (сумма)
+                                c1[0],
+                                c1[1],
+                                max(c1[2], c2[2]),
+                                min(c1[3], c2[3]),
+                                c2[4],
+                                c1[5] + c2[5]
                             ]
                             ohlcv_2h.append(merged)
 
@@ -2048,7 +1744,6 @@ def analyst_loop():
                             and sq2_key in sent_attention):
                         continue
 
-                    # Базовые индикаторы 2H
                     rsi_2h    = calculate_rsi_wilder(closes_2h)
                     v_hist_2h = [x[5] for x in closed_2h[-21:-1]]
                     v_avg_2h  = np.mean(v_hist_2h) if v_hist_2h else 1.0
@@ -2064,13 +1759,13 @@ def analyst_loop():
                     long_gate_2h  = ssma_allows_long(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
                     short_gate_2h = ssma_allows_short(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
 
-                    # Исключение SSMA для 2H: сжатие + CVD bull + отскок 2%
-                    # Перед взрывом цена часто в "тоннеле" ниже SSMA
-                    # Сжатие + бычий CVD = достаточное подтверждение
-                    # (вычисляется после detect_volatility_squeeze)
-
+                    # ── ИЗМЕНЕНИЕ 3: swing_bars=5 вместо 10 ──────────────────
+                    # Было: swing_bars=10 → окно 20 свечей = 40 часов
+                    # Стало: swing_bars=5 → окно 10 свечей = 20 часов
+                    # Уровни более локальные → near_sl/sh срабатывает раньше
+                    # → ранний лонг/шорт приходит до движения, не в момент
                     sw_lp_2h, sw_hp_2h, near_sl_2h, near_sh_2h, sw_l_2h, sw_h_2h = \
-                        calculate_swing_hilo(ohlcv_2h, swing_bars=10)
+                        calculate_swing_hilo(ohlcv_2h, swing_bars=SWING_BARS_2H)
 
                     cvd_level_2h, _ = calc_cvd_level(closed_2h)
                     cvd_emoji_2h = {"bull":"🟢","bull_div":"🟢✨",
@@ -2079,18 +1774,15 @@ def analyst_loop():
                     is_sq, sq_ratio, sq_slope, sq_bars, sq_label = \
                         detect_volatility_squeeze(closed_2h, period=3, avg_period=50)
 
-                    # ATR Map — 4-компонентный скор
                     atr_map_score, atr_map_forming, atr_map_mature, atr_map_label, atr_map_comp = \
                         detect_atr_map_squeeze(closed_2h)
 
-                    # Объединённый флаг сжатия: наш ИЛИ ATR Map
-                    # Объём текущей 2H свечи vs норма
+                    atr_map_active = atr_map_forming
+
                     cur_vol_2h_rel = (ohlcv_2h[-1][5] /
                         (sum(x[5] for x in closed_2h[-20:]) / 20)
                         if closed_2h else 1.0)
 
-                    # Проверка: цена уже в движении (только для нашего ATR squeeze)
-                    # Если за последние 3 свечи цена прошла >3% — сжатие уже кончилось
                     if len(closed_2h) >= 3:
                         price_3back = closed_2h[-3][4]
                         recent_move_pct = abs(current_2h - price_3back) / price_3back * 100
@@ -2098,17 +1790,9 @@ def analyst_loop():
                         recent_move_pct = 0.0
                     already_moving = recent_move_pct > 3.0
 
-                    # Наш ATR squeeze: блокируем если уже в движении или объём аномальный
                     is_sq_clean = is_sq and not already_moving and cur_vol_2h_rel < 1.5
 
-                    # ATR Map: полная свобода — без фильтров объёма и движения
-                    atr_map_active = atr_map_forming
-
-                    any_squeeze = is_sq_clean or atr_map_active
-
-                    # Исключение SSMA ворот для 2H:
-                    # Сжатие + CVD bull + отскок 2%+ → открываем лонг ворота
-                    # Сжатие + CVD bear + откат 2%+ → открываем шорт ворота
+                    # Исключение SSMA ворот
                     if (not long_gate_2h and is_sq
                             and cvd_level_2h in ('bull', 'bull_div')
                             and ib_bounce_2h >= 1.5):
@@ -2128,12 +1812,24 @@ def analyst_loop():
                     btc_line = f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%"
                     vol_line = f"📦 Объём 24H: ${vol_24h_2h/1_000_000:.1f}M"
 
-                    # ── СЖАТИЕ ──
+                    # ══════════════════════════════════════════════════
+                    # СЖАТИЕ 2H
+                    # ИЗМЕНЕНИЕ 1+2: условие теперь (is_sq OR atr_map_active)
+                    # Порог объёма MIN_VOLUME_SQUEEZE = $500K (было $1M)
+                    #
+                    # Было:  is_sq AND vol >= $1M
+                    # Стало: (is_sq OR atr_map_active) AND vol >= $500K
+                    #
+                    # Что даёт:
+                    # - ATR Map 60+ теперь сам триггерит алерт
+                    # - Монеты с объёмом $500K-$1M тоже попадают
+                    # - Фильтр cur_vol_2h < 1.5 остаётся — защита от уже начавшегося движения
+                    # ══════════════════════════════════════════════════
                     if (sq2_key not in sent_attention
-                            and is_sq
-                            and vol_24h_2h >= MIN_VOLUME_ATTENTION
+                            and (is_sq or atr_map_active)          # ← ИЗМЕНЕНИЕ 1
+                            and vol_24h_2h >= MIN_VOLUME_SQUEEZE   # ← ИЗМЕНЕНИЕ 2
                             and cur_vol_2h < 1.5):
-                        # Определяем вероятное направление взрыва по контексту
+
                         if ssma_trend_2h in ('bull_strong', 'bull_weak') and cvd_level_2h in ('bull', 'bull_div'):
                             sq_direction = "⚡️ Вероятный взрыв: ВВЕРХ 📈"
                         elif ssma_trend_2h in ('bear_strong', 'bear_weak') and cvd_level_2h in ('bear', 'bear_div'):
@@ -2145,7 +1841,7 @@ def analyst_loop():
                         else:
                             sq_direction = "⚪️ Направление не определено — смотри пробой"
 
-                        # Строим блок сжатия — наш + ATR Map
+                        # Строим блок — показываем то что сработало
                         sq_block = []
                         if is_sq_clean:
                             sq_block.append(sq_label)
@@ -2178,14 +1874,19 @@ def analyst_loop():
                         send_msg(msg)
                         sent_attention[sq2_key] = time.time()
                         bot_status["early_2h_sent"] += 1
-                        logging.info(f"СЖАТИЕ 2H: {symbol} ratio={sq_ratio:.2f} bars={sq_bars}")
+                        logging.info(f"СЖАТИЕ 2H: {symbol} is_sq={is_sq} atr_map={atr_map_score:.0f} ratio={sq_ratio:.2f}")
 
-                    # ── РАННИЙ ЛОНГ 2H ──
+                    # ══════════════════════════════════════════════════
+                    # РАННИЙ ЛОНГ 2H
+                    # ИЗМЕНЕНИЕ 3: swing_bars=5 → near_sl_2h срабатывает
+                    # раньше, на более локальных уровнях
+                    # Объём остаётся MIN_VOLUME_ATTENTION = $1M
+                    # ══════════════════════════════════════════════════
                     if (ib2_key_l not in sent_attention
                             and ib_bounce_2h >= 1.0
                             and cur_vol_2h >= 1.2
                             and long_gate_2h
-                            and near_sl_2h
+                            and near_sl_2h                         # ← теперь swing_bars=5
                             and vol_24h_2h >= MIN_VOLUME_ATTENTION):
                         parts = [
                             f"⚡️ <b>РАННИЙ ЛОНГ 2H{wl_2h}</b>",
@@ -2209,14 +1910,16 @@ def analyst_loop():
                         send_msg("\n".join(parts))
                         sent_attention[ib2_key_l] = time.time()
                         bot_status["early_2h_sent"] += 1
-                        logging.info(f"РАННИЙ ЛОНГ 2H: {symbol} bounce={ib_bounce_2h:.1f}%")
+                        logging.info(f"РАННИЙ ЛОНГ 2H: {symbol} bounce={ib_bounce_2h:.1f}% swing_bars={SWING_BARS_2H}")
 
-                    # ── РАННИЙ ШОРТ 2H ──
+                    # ══════════════════════════════════════════════════
+                    # РАННИЙ ШОРТ 2H
+                    # ══════════════════════════════════════════════════
                     if (ib2_key_s not in sent_attention
                             and ib_pullback_2h >= 1.0
                             and cur_vol_2h >= 1.2
                             and short_gate_2h
-                            and near_sh_2h
+                            and near_sh_2h                         # ← теперь swing_bars=5
                             and vol_24h_2h >= MIN_VOLUME_ATTENTION):
                         parts = [
                             f"⚡️ <b>РАННИЙ ШОРТ 2H{wl_2h}</b>",
@@ -2240,7 +1943,7 @@ def analyst_loop():
                         send_msg("\n".join(parts))
                         sent_attention[ib2_key_s] = time.time()
                         bot_status["early_2h_sent"] += 1
-                        logging.info(f"РАННИЙ ШОРТ 2H: {symbol} pullback={ib_pullback_2h:.1f}%")
+                        logging.info(f"РАННИЙ ШОРТ 2H: {symbol} pullback={ib_pullback_2h:.1f}% swing_bars={SWING_BARS_2H}")
 
                 except ccxt.RateLimitExceeded:
                     logging.warning(f"Rate limit 2H {symbol}, пауза 30с"); time.sleep(30)
@@ -2254,7 +1957,7 @@ def analyst_loop():
             sent_attention = {k: v for k, v in sent_attention.items() if now - v < 86400}
             bot_status["iterations"]    += 1
             bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
-            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H: {len(top100_2h)} | "
+            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H: {len(top250_2h)} | "
                          f"Сигналов: {bot_status['signals_sent']} | "
                          f"Внимание: {bot_status['attention_sent']} | "
                          f"Ранних 2H: {bot_status['early_2h_sent']} | "
@@ -2270,7 +1973,7 @@ def analyst_loop():
 @app.route('/health')
 def health():
     uptime = str(datetime.now() - datetime.fromisoformat(bot_status["started_at"])).split('.')[0]
-    return (f"✅ OK | v6.0\n"
+    return (f"✅ OK | v6.1\n"
             f"Uptime: {uptime}\n"
             f"Итераций: {bot_status['iterations']}\n"
             f"Ошибок: {bot_status['errors']}\n"
