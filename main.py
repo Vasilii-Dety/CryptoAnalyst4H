@@ -2077,20 +2077,34 @@ def analyst_loop():
                                     "bear":"🔴","bear_div":"🔴✨"}.get(cvd_level_2h, "⚪️")
 
                     is_sq, sq_ratio, sq_slope, sq_bars, sq_label = \
-                        detect_volatility_squeeze(closed_2h, period=5, avg_period=20)
+                        detect_volatility_squeeze(closed_2h, period=3, avg_period=50)
 
                     # ATR Map — 4-компонентный скор
                     atr_map_score, atr_map_forming, atr_map_mature, atr_map_label, atr_map_comp = \
                         detect_atr_map_squeeze(closed_2h)
 
                     # Объединённый флаг сжатия: наш ИЛИ ATR Map
-                    # ATR Map: только если объём не аномальный
-                    # (если объём уже взорвался - сжатие кончилось)
-                    cur_vol_2h_rel = (ohlcv_2h[-1][5] / 
+                    # Объём текущей 2H свечи vs норма
+                    cur_vol_2h_rel = (ohlcv_2h[-1][5] /
                         (sum(x[5] for x in closed_2h[-20:]) / 20)
                         if closed_2h else 1.0)
-                    atr_map_active = atr_map_forming and cur_vol_2h_rel < 1.5
-                    any_squeeze = is_sq or atr_map_active
+
+                    # Проверка: цена уже в движении (только для нашего ATR squeeze)
+                    # Если за последние 3 свечи цена прошла >3% — сжатие уже кончилось
+                    if len(closed_2h) >= 3:
+                        price_3back = closed_2h[-3][4]
+                        recent_move_pct = abs(current_2h - price_3back) / price_3back * 100
+                    else:
+                        recent_move_pct = 0.0
+                    already_moving = recent_move_pct > 3.0
+
+                    # Наш ATR squeeze: блокируем если уже в движении или объём аномальный
+                    is_sq_clean = is_sq and not already_moving and cur_vol_2h_rel < 1.5
+
+                    # ATR Map: полная свобода — без фильтров объёма и движения
+                    atr_map_active = atr_map_forming
+
+                    any_squeeze = is_sq_clean or atr_map_active
 
                     # Исключение SSMA ворот для 2H:
                     # Сжатие + CVD bull + отскок 2%+ → открываем лонг ворота
@@ -2133,7 +2147,7 @@ def analyst_loop():
 
                         # Строим блок сжатия — наш + ATR Map
                         sq_block = []
-                        if is_sq:
+                        if is_sq_clean:
                             sq_block.append(sq_label)
                         if atr_map_active:
                             maturity = "🟠 ЗРЕЛОЕ" if atr_map_mature else "🟡 формируется"
