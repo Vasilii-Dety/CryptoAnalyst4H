@@ -8,12 +8,621 @@ from flask import Flask
 import threading
 import numpy as np
 
+# ─────────────────────────────────────────────
+# v6.2: новый блок REVERSAL_4H + трекер сигналов
+# ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+# Встроенный модуль REVERSAL_4H (раньше был отдельным файлом reversal_4h.py)
+# Логика: 5 жёстких слотов для разворотных сигналов на 4H
+# Все имена внутри начинаются с _rev_ или REV_ чтобы не было конфликтов
+# ═══════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────
+# КОНСТАНТЫ
+# ─────────────────────────────────────────────────────────────────────
+REV_WEEK_BARS_4H        = 42      # 7 дней × 6 свечей/день
+REV_EXTREME_ZONE_PCT    = 5.0     # цена в нижних/верхних 5% диапазона
+REV_MIN_RANGE_PCT       = 8.0     # размах недели должен быть ≥ 8% (иначе нет от чего отскакивать)
+
+REV_VETO_RECENT_3BARS_PCT = 12.0  # за последние 3 свечи 4H движение не более 12% (иначе нож)
+REV_VETO_CAPITULATION_PCT = 5.0   # текущая 4H свеча: если -5% и объём ×3 — НЕ входим
+REV_VETO_BTC_CH_4H        = 2.0   # |BTC ch| ≥ 2% за 4H — макрорежим, режем альты против BTC
+
+# Цели и стопы (горизонт сделки 2-5 дней)
+REV_MIN_TP1_PCT         = 1.5     # минимум 1.5% до TP1, иначе не интересно
+REV_MAX_TP1_PCT         = 7.0     # максимум 7% (за 5 дней реалистично)
+REV_MIN_RR              = 1.8
+REV_ATR_STOP_BUFFER     = 0.3     # стоп = за экстремум + 0.3 ATR
+REV_ATR_CAP_MULT        = 4.0     # потолок TP = current ± 4*ATR (если Fibo дальше)
+
+# Объём
+REV_MIN_VOLUME_24H      = 5_000_000
+REV_TRIGGER_VOL_MULT    = 1.5     # объём 1H триггерной свечи должен быть ≥ avg × 1.5
+
+
+# ─────────────────────────────────────────────────────────────────────
+# БАЗОВЫЕ ИНДИКАТОРЫ (минимум, без зависимости от старого кода)
+# ─────────────────────────────────────────────────────────────────────
+def _rev_atr(ohlcv, period=14):
+    if len(ohlcv) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(ohlcv)):
+        h, l, pc = ohlcv[i][2], ohlcv[i][3], ohlcv[i-1][4]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr = np.mean(trs[:period])
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def _rev_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    d = np.diff(closes)
+    g = np.where(d > 0, d, 0.0)
+    l = np.where(d < 0, -d, 0.0)
+    ag = np.mean(g[:period])
+    al = np.mean(l[:period])
+    for i in range(period, len(g)):
+        ag = (ag * (period - 1) + g[i]) / period
+        al = (al * (period - 1) + l[i]) / period
+    if al == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + ag / al))
+
+
+def _rev_cvd_proxy(ohlcv):
+    """Возвращает массив накопительного дельта-объёма (упрощённо)."""
+    cum = 0.0
+    out = []
+    for c in ohlcv:
+        h, l, cl, v = c[2], c[3], c[4], c[5]
+        ratio = (cl - l) / (h - l) if h != l else 0.5
+        cum += (ratio - 0.5) * 2 * v
+        out.append(cum)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# СЛОТ 1: НЕДЕЛЬНЫЙ ЭКСТРЕМУМ
+# ─────────────────────────────────────────────────────────────────────
+def _rev_check_weekly_extreme(closed_4h, mode='long'):
+    """
+    Проверяет: цена в крайних 5% от 7-дневного диапазона + размах ≥ 8%.
+    Возвращает (passed: bool, info: dict).
+    """
+    if len(closed_4h) < REV_WEEK_BARS_4H:
+        return False, {}
+
+    window = closed_4h[-REV_WEEK_BARS_4H:]
+    week_high = max(c[2] for c in window)
+    week_low  = min(c[3] for c in window)
+    current   = closed_4h[-1][4]
+
+    week_range = week_high - week_low
+    if week_low <= 0:
+        return False, {}
+
+    range_pct = week_range / week_low * 100
+    if range_pct < REV_MIN_RANGE_PCT:
+        return False, {"reason": f"range_pct={range_pct:.1f}% < {REV_MIN_RANGE_PCT}%"}
+
+    # положение в диапазоне (0% = на лоу, 100% = на хае)
+    position_pct = (current - week_low) / week_range * 100
+
+    if mode == 'long':
+        # цена в нижних 5%
+        if position_pct > REV_EXTREME_ZONE_PCT:
+            return False, {"reason": f"position={position_pct:.1f}% > {REV_EXTREME_ZONE_PCT}%"}
+        return True, {
+            "week_high": week_high,
+            "week_low":  week_low,
+            "range_pct": range_pct,
+            "position_pct": position_pct,
+            "extreme":   week_low,
+        }
+    else:
+        # цена в верхних 5% (position_pct ≥ 95)
+        if position_pct < (100 - REV_EXTREME_ZONE_PCT):
+            return False, {"reason": f"position={position_pct:.1f}% < {100-REV_EXTREME_ZONE_PCT}%"}
+        return True, {
+            "week_high": week_high,
+            "week_low":  week_low,
+            "range_pct": range_pct,
+            "position_pct": position_pct,
+            "extreme":   week_high,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# СЛОТ 2: ИСТОЩЕНИЕ ДВИЖЕНИЯ (на 4H)
+# ─────────────────────────────────────────────────────────────────────
+def _rev_check_exhaustion(closed_4h, mode='long'):
+    """
+    Минимум одно из:
+    - RSI дивергенция
+    - CVD дивергенция
+    - Падающий объём на последних 3 свечах
+    - Climax bar (объём ×2 + длинный фитиль)
+
+    Возвращает (passed, list_of_signals).
+    """
+    if len(closed_4h) < 25:
+        return False, []
+
+    closes = [c[4] for c in closed_4h]
+    highs  = [c[2] for c in closed_4h]
+    lows   = [c[3] for c in closed_4h]
+    vols   = [c[5] for c in closed_4h]
+
+    signals = []
+
+    # --- RSI дивергенция ---
+    lookback = 10
+    rsi_now = _rev_rsi(closes[-(lookback + 14):])
+    rsi_past_window = []
+    for i in range(lookback):
+        end = len(closes) - lookback + i + 1
+        rsi_past_window.append(_rev_rsi(closes[max(0, end - 30):end]))
+
+    price_window = closes[-lookback:]
+    if mode == 'long':
+        # цена сделала новый минимум, RSI — нет
+        if (closes[-1] <= min(price_window[:-1])
+                and rsi_now > min(rsi_past_window[:-1])):
+            signals.append(f"RSI bull div ({rsi_now:.0f})")
+    else:
+        if (closes[-1] >= max(price_window[:-1])
+                and rsi_now < max(rsi_past_window[:-1])):
+            signals.append(f"RSI bear div ({rsi_now:.0f})")
+
+    # --- CVD дивергенция ---
+    cvd = _rev_cvd_proxy(closed_4h)
+    if mode == 'long':
+        if (closes[-1] <= min(price_window[:-1])
+                and cvd[-1] > min(cvd[-lookback:-1])):
+            signals.append("CVD bull div")
+    else:
+        if (closes[-1] >= max(price_window[:-1])
+                and cvd[-1] < max(cvd[-lookback:-1])):
+            signals.append("CVD bear div")
+
+    # --- Падающий объём на последних 3 свечах ---
+    avg_vol_20 = np.mean(vols[-23:-3]) if len(vols) >= 23 else np.mean(vols[:-3])
+    last3_vol  = np.mean(vols[-3:]) if len(vols) >= 3 else 0
+    if avg_vol_20 > 0 and last3_vol < avg_vol_20 * 0.8:
+        signals.append(f"vol fading (×{last3_vol/avg_vol_20:.2f})")
+
+    # --- Climax bar в одной из последних 2 свечей ---
+    for idx in (-1, -2):
+        if abs(idx) > len(closed_4h):
+            continue
+        c = closed_4h[idx]
+        h, l, op, cl, v = c[2], c[3], c[1], c[4], c[5]
+        full_range = h - l
+        if full_range <= 0 or avg_vol_20 <= 0:
+            continue
+        body = abs(cl - op)
+        # вместо max(...) объём считаем относительно среднего
+        vol_mult = v / avg_vol_20
+
+        if mode == 'long':
+            lower_wick = (min(op, cl) - l) / full_range
+            if vol_mult >= 2.0 and lower_wick >= 0.5:
+                signals.append(f"climax bar (vol ×{vol_mult:.1f}, wick {lower_wick*100:.0f}%)")
+                break
+        else:
+            upper_wick = (h - max(op, cl)) / full_range
+            if vol_mult >= 2.0 and upper_wick >= 0.5:
+                signals.append(f"climax bar (vol ×{vol_mult:.1f}, wick {upper_wick*100:.0f}%)")
+                break
+
+    return len(signals) > 0, signals
+
+
+# ─────────────────────────────────────────────────────────────────────
+# СЛОТ 3: ТРИГГЕР НА 1H (после закрытия 1H свечи)
+# ─────────────────────────────────────────────────────────────────────
+def _rev_check_1h_trigger(ohlcv_1h, mode='long'):
+    """
+    Анализирует ПОСЛЕДНЮЮ ЗАКРЫТУЮ 1H свечу.
+    Минимум одно из:
+    - Hammer/Pin Bar + объём × ≥ 1.5
+    - Engulfing
+    - BB-style: предыдущая свеча была выходом за экстремум, текущая закрылась обратно
+
+    closed_1h[-1] = последняя закрытая.
+    Возвращает (passed, list_of_signals, last_close).
+    """
+    if len(ohlcv_1h) < 22:
+        return False, [], None
+
+    closed_1h = ohlcv_1h[:-1]   # последняя закрытая
+    if len(closed_1h) < 21:
+        return False, [], None
+
+    last = closed_1h[-1]
+    prev = closed_1h[-2]
+    op, h, l, cl, v = last[1], last[2], last[3], last[4], last[5]
+
+    vols = [c[5] for c in closed_1h[-21:-1]]
+    avg_vol = np.mean(vols) if vols else 1.0
+
+    signals = []
+    full_range = h - l
+    if full_range <= 0:
+        return False, [], cl
+
+    body = abs(cl - op)
+    body_ratio = body / full_range
+
+    # --- Hammer/Pin Bar ---
+    if mode == 'long':
+        lower_wick = (min(op, cl) - l) / full_range
+        if (lower_wick >= 0.55          # длинный нижний фитиль
+                and body_ratio <= 0.35   # маленькое тело
+                and cl > op              # бычье закрытие
+                and v >= avg_vol * REV_TRIGGER_VOL_MULT):
+            signals.append(f"hammer 1H (wick {lower_wick*100:.0f}%, vol ×{v/avg_vol:.1f})")
+    else:
+        upper_wick = (h - max(op, cl)) / full_range
+        if (upper_wick >= 0.55
+                and body_ratio <= 0.35
+                and cl < op
+                and v >= avg_vol * REV_TRIGGER_VOL_MULT):
+            signals.append(f"pin bar 1H (wick {upper_wick*100:.0f}%, vol ×{v/avg_vol:.1f})")
+
+    # --- Engulfing ---
+    p_op, p_cl = prev[1], prev[4]
+    if mode == 'long':
+        if (cl > op              # текущая бычья
+                and p_cl < p_op  # предыдущая медвежья
+                and cl >= p_op   # закрылись выше открытия предыдущей
+                and op <= p_cl   # открылись ниже закрытия предыдущей
+                and v >= avg_vol * 1.2):
+            signals.append("bullish engulfing 1H")
+    else:
+        if (cl < op
+                and p_cl > p_op
+                and cl <= p_op
+                and op >= p_cl
+                and v >= avg_vol * 1.2):
+            signals.append("bearish engulfing 1H")
+
+    # --- Reclaim: предыдущая 1H пробила экстремум, текущая закрылась обратно ---
+    # Используем минимум/максимум за 20 предыдущих 1H свечей как локальный экстремум
+    window_lows  = [c[3] for c in closed_1h[-21:-1]]
+    window_highs = [c[2] for c in closed_1h[-21:-1]]
+    if window_lows and window_highs:
+        local_low_20  = min(window_lows)
+        local_high_20 = max(window_highs)
+        if mode == 'long':
+            # текущая 1H зашла под локальный лоу, но закрылась выше него
+            if l < local_low_20 * 0.999 and cl > local_low_20 * 1.001 and cl > op:
+                signals.append(f"reclaim 1H (failed breakdown {local_low_20:.6g})")
+        else:
+            if h > local_high_20 * 1.001 and cl < local_high_20 * 0.999 and cl < op:
+                signals.append(f"reject 1H (failed breakout {local_high_20:.6g})")
+
+    return len(signals) > 0, signals, cl
+
+
+def _rev_find_pivot_levels(closed_4h, current_price, mode='long', tolerance=0.005):
+    """
+    Ищет горизонтальные уровни (кластеры пивотов) в 7-дневном окне.
+    Для long — выше цены (сопротивления), для short — ниже (поддержки).
+    """
+    window = closed_4h[-REV_WEEK_BARS_4H:]
+    highs = [c[2] for c in window]
+    lows  = [c[3] for c in window]
+
+    pivots = []
+    for i in range(2, len(window) - 2):
+        if mode == 'long':
+            # хаи как сопротивления
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2]
+                    and highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+                pivots.append(highs[i])
+        else:
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2]
+                    and lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+                pivots.append(lows[i])
+
+    if not pivots:
+        return []
+
+    # кластеризуем близкие уровни
+    pivots.sort()
+    clusters = [pivots[0]]
+    for p in pivots[1:]:
+        if (p - clusters[-1]) / clusters[-1] <= tolerance:
+            clusters[-1] = (clusters[-1] + p) / 2
+        else:
+            clusters.append(p)
+
+    if mode == 'long':
+        return sorted([c for c in clusters if c > current_price * 1.005])
+    else:
+        return sorted([c for c in clusters if c < current_price * 0.995], reverse=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# СЛОТ 4: ДОСТИЖИМАЯ ЦЕЛЬ + R/R
+# ─────────────────────────────────────────────────────────────────────
+def _rev_calc_targets(closed_4h, current_price, extreme_value, mode='long'):
+    """
+    TP1 = ближайший структурный уровень (Fibo 50% от движения к экстремуму
+          или ближайший локальный уровень за неделю).
+    Stop = за экстремум + 0.3 ATR буфер.
+
+    Возвращает (passed, target, stop, target_pct, stop_pct, rr, comment).
+    """
+    atr = _rev_atr(closed_4h, period=14)
+    if atr is None or atr <= 0:
+        return False, None, None, 0, 0, 0, "no ATR"
+
+    # Найдём "якорь" движения — крайний хай/лой С ДРУГОЙ СТОРОНЫ за неделю
+    window = closed_4h[-REV_WEEK_BARS_4H:]
+
+    if mode == 'long':
+        # отскок ОТ лоя ВВЕРХ → якорь = недельный хай
+        anchor_high = max(c[2] for c in window)
+        impulse_down = anchor_high - extreme_value  # размах движения вниз
+        if impulse_down <= 0:
+            return False, None, None, 0, 0, 0, "no impulse"
+
+        # Кандидаты для TP1:
+        #   - Fibo 38.2% восстановления
+        #   - ближайший pivot (если есть)
+        #   - "ATR cap" — current + 3*ATR (чтобы не ставить мечту)
+        fib_382 = extreme_value + impulse_down * 0.382
+        pivots_above = _rev_find_pivot_levels(closed_4h, current_price, mode='long')
+        atr_cap = current_price + REV_ATR_CAP_MULT * atr
+
+        candidates = [fib_382, atr_cap]
+        candidates += pivots_above
+        candidates = [c for c in candidates if c > current_price * 1.001]
+
+        if not candidates:
+            return False, None, None, 0, 0, 0, "no TP candidates"
+
+        # БЛИЖАЙШИЙ — это TP1 (фиксация на ближайшем сопротивлении)
+        target = min(candidates)
+
+        stop = extreme_value - atr * REV_ATR_STOP_BUFFER
+
+        target_pct = (target - current_price) / current_price * 100
+        stop_pct   = (current_price - stop) / current_price * 100
+
+    else:
+        anchor_low = min(c[3] for c in window)
+        impulse_up = extreme_value - anchor_low
+        if impulse_up <= 0:
+            return False, None, None, 0, 0, 0, "no impulse"
+
+        fib_382 = extreme_value - impulse_up * 0.382
+        pivots_below = _rev_find_pivot_levels(closed_4h, current_price, mode='short')
+        atr_cap = current_price - REV_ATR_CAP_MULT * atr
+
+        candidates = [fib_382, atr_cap]
+        candidates += pivots_below
+        candidates = [c for c in candidates if c < current_price * 0.999]
+
+        if not candidates:
+            return False, None, None, 0, 0, 0, "no TP candidates"
+
+        target = max(candidates)
+
+        stop = extreme_value + atr * REV_ATR_STOP_BUFFER
+
+        target_pct = (current_price - target) / current_price * 100
+        stop_pct   = (stop - current_price) / current_price * 100
+
+    if target_pct <= 0 or stop_pct <= 0:
+        return False, None, None, 0, 0, 0, "negative pct"
+
+    if target_pct < REV_MIN_TP1_PCT:
+        return False, None, None, target_pct, stop_pct, 0, f"TP {target_pct:.2f}% < {REV_MIN_TP1_PCT}%"
+    if target_pct > REV_MAX_TP1_PCT:
+        return False, None, None, target_pct, stop_pct, 0, f"TP {target_pct:.2f}% > {REV_MAX_TP1_PCT}%"
+
+    rr = target_pct / stop_pct
+    if rr < REV_MIN_RR:
+        return False, None, None, target_pct, stop_pct, rr, f"RR {rr:.2f} < {REV_MIN_RR}"
+
+    return True, target, stop, target_pct, stop_pct, rr, "ok"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# СЛОТ 5: НЕ ЛОВЛЯ НОЖА
+# ─────────────────────────────────────────────────────────────────────
+def _rev_check_not_knife(ohlcv_4h, mode='long'):
+    """
+    - За последние 3 закрытые 4H свечи движение к экстремуму ≤ 12%
+    - Текущая (формирующаяся) 4H свеча НЕ должна быть капитуляцией
+      (-/+ 5% и объём ×3 — ждём)
+
+    Возвращает (passed, reason).
+    """
+    if len(ohlcv_4h) < 5:
+        return False, "not enough data"
+
+    closed = ohlcv_4h[:-1]
+    current_candle = ohlcv_4h[-1]
+
+    # Движение за последние 3 закрытые свечи
+    price_3back = closed[-3][1]   # open 3-й свечи назад
+    price_now   = closed[-1][4]   # close последней закрытой
+    move_3bars  = (price_now - price_3back) / price_3back * 100
+
+    if mode == 'long':
+        if move_3bars < -REV_VETO_RECENT_3BARS_PCT:
+            return False, f"3-bar dump {move_3bars:.1f}% < -{REV_VETO_RECENT_3BARS_PCT}%"
+    else:
+        if move_3bars > REV_VETO_RECENT_3BARS_PCT:
+            return False, f"3-bar pump {move_3bars:.1f}% > {REV_VETO_RECENT_3BARS_PCT}%"
+
+    # Капитуляция в текущей формирующейся свече
+    op = current_candle[1]
+    cl = current_candle[4]
+    v_cur = current_candle[5]
+    vols = [c[5] for c in closed[-20:]]
+    avg_v = np.mean(vols) if vols else 1.0
+
+    if op > 0:
+        cur_change = (cl - op) / op * 100
+        vol_mult = v_cur / avg_v if avg_v > 0 else 1.0
+
+        if mode == 'long' and cur_change < -REV_VETO_CAPITULATION_PCT and vol_mult > 3.0:
+            return False, f"capitulation now ({cur_change:.1f}%, vol ×{vol_mult:.1f})"
+        if mode == 'short' and cur_change > REV_VETO_CAPITULATION_PCT and vol_mult > 3.0:
+            return False, f"euphoria now ({cur_change:.1f}%, vol ×{vol_mult:.1f})"
+
+    return True, "ok"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ВЕТО ПО МАКРО (BTC)
+# ─────────────────────────────────────────────────────────────────────
+def _rev_check_macro(btc_ch_4h, mode='long'):
+    """Только на сильных движениях BTC режем альты против."""
+    if mode == 'long' and btc_ch_4h < -REV_VETO_BTC_CH_4H:
+        return False, f"BTC -{abs(btc_ch_4h):.1f}% за 4H"
+    if mode == 'short' and btc_ch_4h > REV_VETO_BTC_CH_4H:
+        return False, f"BTC +{btc_ch_4h:.1f}% за 4H"
+    return True, "ok"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ГЛАВНАЯ ФУНКЦИЯ ЛОНГ
+# ─────────────────────────────────────────────────────────────────────
+def scan_reversal_4h_long(*, symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h):
+    """
+    Возвращает None если сигнала нет, иначе dict:
+        {
+            'side': 'long',
+            'entry': float,
+            'target': float,
+            'stop': float,
+            'target_pct': float,
+            'stop_pct': float,
+            'rr': float,
+            'quality': int (1-5, число пройденных слотов; всегда 5),
+            'details': list[str],
+            'message': str (готовый HTML для send_msg),
+        }
+    """
+    return _rev_scan(symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h, mode='long')
+
+
+def scan_reversal_4h_short(*, symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h):
+    return _rev_scan(symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h, mode='short')
+
+
+def _rev_scan(symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h, mode):
+    # 0. Базовая проверка объёма
+    if vol_24h < REV_MIN_VOLUME_24H:
+        return None
+    if not ohlcv_4h or len(ohlcv_4h) < REV_WEEK_BARS_4H + 5:
+        return None
+    if not ohlcv_1h or len(ohlcv_1h) < 25:
+        return None
+
+    closed_4h = ohlcv_4h[:-1]
+    current_price = closed_4h[-1][4]
+    details = []
+
+    # МАКРО ВЕТО
+    macro_ok, macro_reason = _rev_check_macro(btc_ch_4h, mode)
+    if not macro_ok:
+        return None
+
+    # СЛОТ 1: НЕДЕЛЬНЫЙ ЭКСТРЕМУМ
+    s1_ok, s1_info = _rev_check_weekly_extreme(closed_4h, mode)
+    if not s1_ok:
+        return None
+    extreme_value = s1_info["extreme"]
+    range_pct = s1_info["range_pct"]
+    position_pct = s1_info["position_pct"]
+    if mode == 'long':
+        details.append(f"📍 7d low {extreme_value:.6g} (range {range_pct:.1f}%, pos {position_pct:.1f}%)")
+    else:
+        details.append(f"📍 7d high {extreme_value:.6g} (range {range_pct:.1f}%, pos {position_pct:.1f}%)")
+
+    # СЛОТ 5 (раньше остальных — дешевле): НЕ ЛОВЛЯ НОЖА
+    s5_ok, s5_reason = _rev_check_not_knife(ohlcv_4h, mode)
+    if not s5_ok:
+        return None
+
+    # СЛОТ 2: ИСТОЩЕНИЕ
+    s2_ok, s2_signals = _rev_check_exhaustion(closed_4h, mode)
+    if not s2_ok:
+        return None
+    details.append("💤 Истощение: " + ", ".join(s2_signals))
+
+    # СЛОТ 3: ТРИГГЕР НА 1H
+    s3_ok, s3_signals, _ = _rev_check_1h_trigger(ohlcv_1h, mode)
+    if not s3_ok:
+        return None
+    details.append("🎯 Триггер 1H: " + ", ".join(s3_signals))
+
+    # СЛОТ 4: ЦЕЛЬ + R/R
+    s4_ok, target, stop, target_pct, stop_pct, rr, s4_comment = \
+        _rev_calc_targets(closed_4h, current_price, extreme_value, mode)
+    if not s4_ok:
+        return None
+
+    # ─── Все 5 слотов пройдены, формируем сигнал ───
+    side_emoji = "🟢" if mode == 'long' else "🔴"
+    side_label = "ЛОНГ" if mode == 'long' else "ШОРТ"
+    arrow = "📈" if mode == 'long' else "📉"
+
+    tv = symbol.replace('/', '').replace(':USDT', '.P')
+    coin = symbol.split("/")[0]
+
+    msg_lines = [
+        f"{side_emoji} <b>РАЗВОРОТ 4H {side_label}</b> {arrow}",
+        f"Монета: <b>{symbol}</b>",
+        f"Цена: <code>{current_price:.6g}</code>",
+        "───────────────────",
+        *[f"  {d}" for d in details],
+        "───────────────────",
+        f"🎯 TP: <code>{target:.6g}</code> ({'+' if mode == 'long' else '-'}{target_pct:.2f}%)",
+        f"🛑 SL: <code>{stop:.6g}</code> ({'-' if mode == 'long' else '+'}{stop_pct:.2f}%)",
+        f"⚖️ R/R: <b>{rr:.2f}</b>",
+        f"📦 Объём 24H: ${vol_24h/1_000_000:.1f}M",
+        f"👑 BTC за 4H: {btc_ch_4h:+.2f}%",
+        "───────────────────",
+        f"⏱ Горизонт: 2-5 дней",
+        f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>",
+        f"📊 <a href='https://www.coinglass.com/futures/{coin}'>CoinGlass</a>",
+    ]
+
+    return {
+        'side': mode,
+        'entry': current_price,
+        'target': target,
+        'stop': stop,
+        'target_pct': target_pct,
+        'stop_pct': stop_pct,
+        'rr': rr,
+        'quality': 5,
+        'details': details,
+        'message': "\n".join(msg_lines),
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# Конец встроенного модуля REVERSAL_4H
+# ═══════════════════════════════════════════════════════════════════
+
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"✅ АНАЛИТИК v6.1 АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
+    return f"✅ АНАЛИТИК v6.2 АКТИВЕН. Время: {datetime.now().strftime('%H:%M:%S')}"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -59,6 +668,7 @@ bot_status = {
     "signals_sent":     0,
     "attention_sent":   0,
     "early_2h_sent":    0,
+    "reversal_sent":    0,
 }
 
 oi_cache: dict = {}
@@ -904,6 +1514,11 @@ def build_tv_link(symbol):
     return f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>"
 
 
+def build_coinglass_link(symbol):
+    coin = symbol.split("/")[0]
+    return f"📊 <a href='https://www.coinglass.com/futures/{coin}'>CoinGlass</a>"
+
+
 def send_msg(text):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     try:
@@ -1092,7 +1707,7 @@ def detect_atr_map_squeeze(ohlcv, atr_length=14, baseline_length=50,
 def analyst_loop():
     sent_signals = {}
     sent_attention = {}
-    logging.info("Аналитик v6.1 запущен.")
+    logging.info("Аналитик v6.2 запущен (REVERSAL_4H + ВНИМАНИЕ + 2H).")
 
     try:
         exchange.load_markets()
@@ -1152,12 +1767,12 @@ def analyst_loop():
 
                     last_closed_ts = closed[-1][0]
                     candle_id      = last_closed_ts // 14_400_000
-                    l_key  = f"{symbol}_{candle_id}_l"
-                    s_key  = f"{symbol}_{candle_id}_s"
-                    la_key = f"{symbol}_{candle_id}_la"
-                    sa_key = f"{symbol}_{candle_id}_sa"
+                    la_key    = f"{symbol}_{candle_id}_la"
+                    sa_key    = f"{symbol}_{candle_id}_sa"
+                    rev_l_key = f"{symbol}_{candle_id}_rev_l"
+                    rev_s_key = f"{symbol}_{candle_id}_rev_s"
 
-                    all_done = (l_key in sent_signals and s_key in sent_signals
+                    all_done = (rev_l_key in sent_signals and rev_s_key in sent_signals
                                 and la_key in sent_attention and sa_key in sent_attention)
                     if all_done:
                         continue
@@ -1427,7 +2042,7 @@ def analyst_loop():
                                 f"⚠️ Свеча не закрыта — ждите подтверждения\n"
                                 f"───────────────────\n"
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
-                                f"{build_tv_link(symbol)}"
+                                f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                                 )
                             )
                             send_msg(msg)
@@ -1461,7 +2076,7 @@ def analyst_loop():
                                 f"⚠️ Свеча не закрыта — ждите подтверждения\n"
                                 f"───────────────────\n"
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
-                                f"{build_tv_link(symbol)}"
+                                f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                                 )
                             )
                             send_msg(msg)
@@ -1504,7 +2119,7 @@ def analyst_loop():
                                 f"(-{stp_pct_a:.1f}%)\n"
                                 f"───────────────────\n"
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
-                                f"{build_tv_link(symbol)}"
+                                f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                             )
                             send_msg(msg)
                             sent_attention[la_key] = time.time()
@@ -1545,142 +2160,74 @@ def analyst_loop():
                                 f"(+{stp_pct_a:.1f}%)\n"
                                 f"───────────────────\n"
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
-                                f"{build_tv_link(symbol)}"
+                                f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                             )
                             send_msg(msg)
                             sent_attention[sa_key] = time.time()
                             bot_status["attention_sent"] += 1
                             logging.info(f"ВНИМАНИЕ ШОРТ: {symbol} score={a_score} sw_high={sw_high_pct:.1f}%")
 
-                    if (l_key not in sent_signals
-                            and long_gate
-                            and wyckoff_long_ok
-                            and wyckoff_phase != 'ranging'
-                            and vol_24h >= MIN_VOLUME_SIGNAL):
+                    # ══════════════════════════════════════════════════
+                    # REVERSAL 4H — НОВЫЙ блок (заменяет старые "СИГНАЛ ЛОНГ/ШОРТ 4H")
+                    # 5 жёстких слотов: weekly extreme, exhaustion, 1H trigger,
+                    # достижимая цель, не ловля ножа. Логика — в reversal_4h.py.
+                    # ══════════════════════════════════════════════════
+                    need_rev_long  = rev_l_key not in sent_signals
+                    need_rev_short = rev_s_key not in sent_signals
 
-                        score, details = calc_score('long')
-                        oi_ok_l = oi_signal in ('bull', 'squeeze_dn')
-                        rr_ok, tgt_pct, stp_pct, rr_val = check_rr(
-                            current_price, target_l, stop_l, 'long',
-                            MIN_TARGET_PCT_SIGNAL, MAX_STOP_PCT)
+                    if (need_rev_long or need_rev_short) and vol_24h >= MIN_VOLUME_SIGNAL:
+                        ohlcv_1h_rev = None
+                        try:
+                            ohlcv_1h_rev = exchange.fetch_ohlcv(symbol, '1h', limit=30)
+                        except Exception as e:
+                            logging.debug(f"1H {symbol} (reversal): {e}")
 
-                        if not oi_ok_l and not (m13_l or cvd_div_l):
-                            score = min(score, 4)
-                        if wyckoff_phase == 'accumulation' and not oi_ok_l:
-                            score = min(score, 5)
+                        if ohlcv_1h_rev and len(ohlcv_1h_rev) >= 25:
+                            # ─── REVERSAL ЛОНГ ───
+                            if need_rev_long:
+                                try:
+                                    sig = scan_reversal_4h_long(
+                                        symbol=symbol,
+                                        ohlcv_4h=ohlcv,
+                                        ohlcv_1h=ohlcv_1h_rev,
+                                        vol_24h=vol_24h,
+                                        btc_ch_4h=ctx['btc_ch'],
+                                    )
+                                except Exception as e:
+                                    logging.error(f"reversal_long {symbol}: {e}")
+                                    sig = None
+                                if sig:
+                                    send_msg(sig['message'])
+                                    sent_signals[rev_l_key] = time.time()
+                                    bot_status["signals_sent"] += 1
+                                    bot_status["reversal_sent"] += 1
+                                    logging.info(
+                                        f"REVERSAL ЛОНГ: {symbol} entry={sig['entry']:.6g} "
+                                        f"tgt={sig['target_pct']:+.2f}% rr={sig['rr']:.2f}"
+                                    )
 
-                        btc_red     = ctx['btc_trend'] == "🔴"
-                        is_strong_l = oi_signal == 'bull' or m13_l or (v_rel > 5 and imb > 60)
-                        veto_macro  = btc_red and not is_strong_l and not after_dump
-                        veto_dump   = v_rel > 10 and imb < -60 and price_ch < -5 and not after_dump
-                        veto_ob     = (rsi > 75 and mfi > 80) and not m13_l
-
-                        if (score >= SCORE_SIGNAL
-                                and oi_ok_l
-                                and rr_ok
-                                and not veto_macro
-                                and not veto_dump
-                                and not veto_ob):
-
-                            status = "⚡️ СИЛЬНЕЕ РЫНКА" if (is_strong_l and btc_red) else "✅ ТРЕНД"
-
-                            msg = (
-                                f"🚨 <b>СИГНАЛ ЛОНГ 4H ({score}/10){wl_badge}</b>\n"
-                                f"Монета: <b>{symbol}</b> | {status}\n"
-                                f"Цена: <code>{current_price:.6g}</code>\n"
-                                f"Сигналы: {', '.join(details)}\n"
-                                f"───────────────────\n"
-                                f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
-                                f"{'📉 BB ATR: Перепродан' if bb_signal=='oversold' else ''}\n"
-                                f"{'🏔️ Swing Low: +' + f'{sw_low_pct:.1f}%' if near_sw_low else ''}\n"
-                                f"{ssma_label}\n"
-                                f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
-                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
-                                f"───────────────────\n"
-                                f"📊 RSI: <b>{rsi:.1f}</b> | MFI: <b>{mfi:.1f}</b>\n"
-                                f"⚖️ Дисбаланс: {'🟢' if imb>0 else '🔴'} <b>{abs(imb):.0f}%</b>\n"
-                                f"{vol_detail}\n"
-                                f"{cvd_emoji} CVD: <b>{cvd_level}</b>\n"
-                                f"{oi_label}\n"
-                                f"{fr_label}\n"
-                                f"───────────────────\n"
-                                f"🎯 Цель: <code>{target_l:.6g}</code> (+{tgt_pct:.1f}%)\n"
-                                f"🛑 Стоп: <code>{stop_l:.6g}</code> (-{stp_pct:.1f}%)\n"
-                                f"⚡️ ATR: <code>{atr:.6g}</code> | R/R {rr_val:.1f}\n"
-                                f"───────────────────\n"
-                                f"🌍 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}% "
-                                f"({ctx['btc_p']:.0f}) | Alt: {ctx['alt_power']} {ctx['alt_ch']:.2f}%\n"
-                                f"{build_tv_link(symbol)}"
-                            )
-                            send_msg(msg)
-                            sent_signals[l_key] = time.time()
-                            bot_status["signals_sent"] += 1
-                            logging.info(f"СИГНАЛ ЛОНГ: {symbol} score={score} OI={oi_signal} RR={rr_val:.1f} tgt={tgt_pct:.1f}%")
-
-                    if (s_key not in sent_signals
-                            and short_gate
-                            and wyckoff_short_ok
-                            and wyckoff_phase != 'ranging'
-                            and vol_24h >= MIN_VOLUME_SIGNAL):
-
-                        score, details = calc_score('short')
-                        oi_ok_s = oi_signal in ('bear', 'squeeze_up')
-                        rr_ok, tgt_pct, stp_pct, rr_val = check_rr(
-                            current_price, target_s, stop_s, 'short',
-                            MIN_TARGET_PCT_SIGNAL, MAX_STOP_PCT)
-
-                        if not oi_ok_s and not (m13_s or cvd_div_s):
-                            score = min(score, 4)
-                        if wyckoff_phase == 'distribution' and not oi_ok_s:
-                            score = min(score, 5)
-
-                        btc_green    = ctx['btc_trend'] == "🟢"
-                        is_strong_s  = oi_signal == 'bear' or m13_s or (v_rel > 5 and imb < -60)
-                        veto_macro   = btc_green and not is_strong_s and not after_pump
-                        veto_pump    = v_rel > 8 and imb > 60 and price_ch > 3 and not after_pump
-                        veto_os      = (rsi < 25 and mfi < 20) and not m13_s
-
-                        if (score >= SCORE_SIGNAL
-                                and oi_ok_s
-                                and rr_ok
-                                and not veto_macro
-                                and not veto_pump
-                                and not veto_os):
-
-                            status = "⚡️ ПРОТИВ РЫНКА" if (is_strong_s and btc_green) else "🔻 ШОРТ"
-
-                            msg = (
-                                f"🚨 <b>СИГНАЛ ШОРТ 4H ({score}/10){wl_badge}</b>\n"
-                                f"Монета: <b>{symbol}</b> | {status}\n"
-                                f"Цена: <code>{current_price:.6g}</code>\n"
-                                f"Сигналы: {', '.join(details)}\n"
-                                f"───────────────────\n"
-                                f"🌊 Wyckoff: <b>{wyckoff_label}</b>\n"
-                                f"{'📈 BB ATR: Перекуплен' if bb_signal=='overbought' else ''}\n"
-                                f"{'🏔️ Swing High: -' + f'{sw_high_pct:.1f}%' if near_sw_high else ''}\n"
-                                f"{ssma_label}\n"
-                                f"{ew['alert_block'] + chr(10) if ew['structure'] != 'neutral' else ''}"
-                                f"{ew_big_label + chr(10) if ew_big_label else ''}"
-                                f"───────────────────\n"
-                                f"📊 RSI: <b>{rsi:.1f}</b> | MFI: <b>{mfi:.1f}</b>\n"
-                                f"⚖️ Дисбаланс: {'🔴' if imb>0 else '🟢'} <b>{abs(imb):.0f}%</b>\n"
-                                f"{vol_detail}\n"
-                                f"{cvd_emoji} CVD: <b>{cvd_level}</b>\n"
-                                f"{oi_label}\n"
-                                f"{fr_label}\n"
-                                f"───────────────────\n"
-                                f"🎯 Цель: <code>{target_s:.6g}</code> (-{tgt_pct:.1f}%)\n"
-                                f"🛑 Стоп: <code>{stop_s:.6g}</code> (+{stp_pct:.1f}%)\n"
-                                f"⚡️ ATR: <code>{atr:.6g}</code> | R/R {rr_val:.1f}\n"
-                                f"───────────────────\n"
-                                f"🌍 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}% "
-                                f"({ctx['btc_p']:.0f}) | Alt: {ctx['alt_power']} {ctx['alt_ch']:.2f}%\n"
-                                f"{build_tv_link(symbol)}"
-                            )
-                            send_msg(msg)
-                            sent_signals[s_key] = time.time()
-                            bot_status["signals_sent"] += 1
-                            logging.info(f"СИГНАЛ ШОРТ: {symbol} score={score} OI={oi_signal} RR={rr_val:.1f} tgt={tgt_pct:.1f}%")
+                            # ─── REVERSAL ШОРТ ───
+                            if need_rev_short:
+                                try:
+                                    sig = scan_reversal_4h_short(
+                                        symbol=symbol,
+                                        ohlcv_4h=ohlcv,
+                                        ohlcv_1h=ohlcv_1h_rev,
+                                        vol_24h=vol_24h,
+                                        btc_ch_4h=ctx['btc_ch'],
+                                    )
+                                except Exception as e:
+                                    logging.error(f"reversal_short {symbol}: {e}")
+                                    sig = None
+                                if sig:
+                                    send_msg(sig['message'])
+                                    sent_signals[rev_s_key] = time.time()
+                                    bot_status["signals_sent"] += 1
+                                    bot_status["reversal_sent"] += 1
+                                    logging.info(
+                                        f"REVERSAL ШОРТ: {symbol} entry={sig['entry']:.6g} "
+                                        f"tgt={sig['target_pct']:+.2f}% rr={sig['rr']:.2f}"
+                                    )
 
                     time.sleep(0.15)
 
@@ -1809,6 +2356,7 @@ def analyst_loop():
                         ssma_lbl_2h = f"{icon} SSMA 2H: {ssma_2h:.4g} ({ssma_slope_2h:+.2f}%/св)"
 
                     tv = build_tv_link(symbol)
+                    cg = build_coinglass_link(symbol)
                     btc_line = f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%"
                     vol_line = f"📦 Объём 24H: ${vol_24h_2h/1_000_000:.1f}M"
 
@@ -1869,7 +2417,8 @@ def analyst_loop():
                             vol_line,
                             "───────────────────",
                             btc_line,
-                            tv
+                            tv,
+                            cg
                         ])
                         send_msg(msg)
                         sent_attention[sq2_key] = time.time()
@@ -1905,7 +2454,8 @@ def analyst_loop():
                         parts += [
                             "───────────────────",
                             "⚠️ Свеча 2H не закрыта — ждите подтверждения",
-                            btc_line, tv
+                            btc_line, tv,
+                            cg
                         ]
                         send_msg("\n".join(parts))
                         sent_attention[ib2_key_l] = time.time()
@@ -1938,7 +2488,8 @@ def analyst_loop():
                         parts += [
                             "───────────────────",
                             "⚠️ Свеча 2H не закрыта — ждите подтверждения",
-                            btc_line, tv
+                            btc_line, tv,
+                            cg
                         ]
                         send_msg("\n".join(parts))
                         sent_attention[ib2_key_s] = time.time()
@@ -1958,7 +2509,7 @@ def analyst_loop():
             bot_status["iterations"]    += 1
             bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
             logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H: {len(top250_2h)} | "
-                         f"Сигналов: {bot_status['signals_sent']} | "
+                         f"Reversal: {bot_status['reversal_sent']} | "
                          f"Внимание: {bot_status['attention_sent']} | "
                          f"Ранних 2H: {bot_status['early_2h_sent']} | "
                          f"BTC vol: {ctx['btc_vol']:.2f}%")
@@ -1973,12 +2524,13 @@ def analyst_loop():
 @app.route('/health')
 def health():
     uptime = str(datetime.now() - datetime.fromisoformat(bot_status["started_at"])).split('.')[0]
-    return (f"✅ OK | v6.1\n"
+    return (f"✅ OK | v6.2 (REVERSAL_4H)\n"
             f"Uptime: {uptime}\n"
             f"Итераций: {bot_status['iterations']}\n"
             f"Ошибок: {bot_status['errors']}\n"
-            f"Сигналов 🚨: {bot_status['signals_sent']}\n"
+            f"Reversal 4H 🚨: {bot_status['reversal_sent']}\n"
             f"Внимание 🔔: {bot_status['attention_sent']}\n"
+            f"Ранних 2H: {bot_status['early_2h_sent']}\n"
             f"Последняя итерация: {bot_status['last_iteration']}")
 
 
