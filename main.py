@@ -596,7 +596,7 @@ def _rev_scan(symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h, mode):
         "───────────────────",
         f"⏱ Горизонт: 2-5 дней",
         f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>",
-        f"📊 <a href='https://www.coinglass.com/futures/{coin}'>CoinGlass</a>",
+        f"📊 <a href='https://www.coinglass.com/open-interest/{coin}'>CoinGlass</a>",
     ]
 
     return {
@@ -1516,7 +1516,7 @@ def build_tv_link(symbol):
 
 def build_coinglass_link(symbol):
     coin = symbol.split("/")[0]
-    return f"📊 <a href='https://www.coinglass.com/futures/{coin}'>CoinGlass</a>"
+    return f"📊 <a href='https://www.coinglass.com/open-interest/{coin}'>CoinGlass</a>"
 
 
 def send_msg(text):
@@ -2333,8 +2333,11 @@ def analyst_loop():
                     if len(closed_2h) >= 3:
                         price_3back = closed_2h[-3][4]
                         recent_move_pct = abs(current_2h - price_3back) / price_3back * 100
+                        # Со знаком: + если рост, − если падение. Нужен для фильтра позднего входа
+                        move_3bars_signed = (current_2h - price_3back) / price_3back * 100
                     else:
                         recent_move_pct = 0.0
+                        move_3bars_signed = 0.0
                     already_moving = recent_move_pct > 3.0
 
                     is_sq_clean = is_sq and not already_moving and cur_vol_2h_rel < 1.5
@@ -2362,21 +2365,19 @@ def analyst_loop():
 
                     # ══════════════════════════════════════════════════
                     # СЖАТИЕ 2H
-                    # ИЗМЕНЕНИЕ 1+2: условие теперь (is_sq OR atr_map_active)
-                    # Порог объёма MIN_VOLUME_SQUEEZE = $500K (было $1M)
+                    # is_sq → триггер по короткому окну (3 свечи)
+                    # atr_map_active → триггер по длинному окну (компрессия 50+ свечей)
+                    # Оба независимы и часто срабатывают на разных монетах.
                     #
-                    # Было:  is_sq AND vol >= $1M
-                    # Стало: (is_sq OR atr_map_active) AND vol >= $500K
-                    #
-                    # Что даёт:
-                    # - ATR Map 60+ теперь сам триггерит алерт
-                    # - Монеты с объёмом $500K-$1M тоже попадают
-                    # - Фильтр cur_vol_2h < 1.5 остаётся — защита от уже начавшегося движения
+                    # Фильтр объёма:
+                    #  - для is_sq: cur_vol_2h < 1.5 защищает от уже разрешившегося сжатия
+                    #  - для atr_map_active: фильтр НЕ применяется, потому что mature-сжатие
+                    #    в длинном окне работает даже если на текущей свече всплеск объёма
                     # ══════════════════════════════════════════════════
                     if (sq2_key not in sent_attention
-                            and (is_sq or atr_map_active)          # ← ИЗМЕНЕНИЕ 1
-                            and vol_24h_2h >= MIN_VOLUME_SQUEEZE   # ← ИЗМЕНЕНИЕ 2
-                            and cur_vol_2h < 1.5):
+                            and (is_sq or atr_map_active)
+                            and vol_24h_2h >= MIN_VOLUME_SQUEEZE
+                            and (cur_vol_2h < 1.5 or atr_map_active)):
 
                         if ssma_trend_2h in ('bull_strong', 'bull_weak') and cvd_level_2h in ('bull', 'bull_div'):
                             sq_direction = "⚡️ Вероятный взрыв: ВВЕРХ 📈"
@@ -2430,13 +2431,19 @@ def analyst_loop():
                     # ИЗМЕНЕНИЕ 3: swing_bars=5 → near_sl_2h срабатывает
                     # раньше, на более локальных уровнях
                     # Объём остаётся MIN_VOLUME_ATTENTION = $1M
+                    #
+                    # ФИЛЬТРЫ ОТ ПОЗДНИХ ВХОДОВ:
+                    # - RSI 2H ≤ 65 (если перекуплено — шанс отката высок)
+                    # - 3-bar move ≤ +5% (если уже сильно выросло — поздно входить)
                     # ══════════════════════════════════════════════════
                     if (ib2_key_l not in sent_attention
                             and ib_bounce_2h >= 1.0
                             and cur_vol_2h >= 1.2
                             and long_gate_2h
-                            and near_sl_2h                         # ← теперь swing_bars=5
-                            and vol_24h_2h >= MIN_VOLUME_ATTENTION):
+                            and near_sl_2h
+                            and vol_24h_2h >= MIN_VOLUME_ATTENTION
+                            and rsi_2h <= 65
+                            and move_3bars_signed <= 5.0):
                         parts = [
                             f"⚡️ <b>РАННИЙ ЛОНГ 2H{wl_2h}</b>",
                             f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
@@ -2464,13 +2471,19 @@ def analyst_loop():
 
                     # ══════════════════════════════════════════════════
                     # РАННИЙ ШОРТ 2H
+                    #
+                    # ФИЛЬТРЫ ОТ ПОЗДНИХ ВХОДОВ:
+                    # - RSI 2H ≥ 35 (если перепродано — шанс отскока высок)
+                    # - 3-bar move ≥ -5% (если уже сильно упало — поздно шортить)
                     # ══════════════════════════════════════════════════
                     if (ib2_key_s not in sent_attention
                             and ib_pullback_2h >= 1.0
                             and cur_vol_2h >= 1.2
                             and short_gate_2h
-                            and near_sh_2h                         # ← теперь swing_bars=5
-                            and vol_24h_2h >= MIN_VOLUME_ATTENTION):
+                            and near_sh_2h
+                            and vol_24h_2h >= MIN_VOLUME_ATTENTION
+                            and rsi_2h >= 35
+                            and move_3bars_signed >= -5.0):
                         parts = [
                             f"⚡️ <b>РАННИЙ ШОРТ 2H{wl_2h}</b>",
                             f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
