@@ -596,7 +596,7 @@ def _rev_scan(symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h, mode):
         "───────────────────",
         f"⏱ Горизонт: 2-5 дней",
         f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>",
-        f"📊 <a href='https://www.coinglass.com/open-interest/{coin}'>CoinGlass</a>",
+        f"📊 <a href='https://www.coinglass.com/tv/Binance_{coin}USDT'>CoinGlass СуперГрафик</a>",
     ]
 
     return {
@@ -1516,7 +1516,7 @@ def build_tv_link(symbol):
 
 def build_coinglass_link(symbol):
     coin = symbol.split("/")[0]
-    return f"📊 <a href='https://www.coinglass.com/open-interest/{coin}'>CoinGlass</a>"
+    return f"📊 <a href='https://www.coinglass.com/tv/Binance_{coin}USDT'>CoinGlass СуперГрафик</a>"
 
 
 def send_msg(text):
@@ -2258,10 +2258,29 @@ def analyst_loop():
 
                     ohlcv_2h = None
                     if ohlcv_raw_1h and len(ohlcv_raw_1h) >= 4:
+                        # ───────────────────────────────────────────────
+                        # КАЛЕНДАРНАЯ СКЛЕЙКА 1H → 2H
+                        # Раньше склеивали с i=0 → граница плавала каждый час →
+                        # cid_2h менялся каждый час → дедупликация не работала →
+                        # алерты приходили повторно каждый час.
+                        # Сейчас: 2H свеча всегда начинается в чётный час UTC
+                        # (00:00, 02:00, 04:00, …). cid_2h стабилен 2 часа.
+                        # ───────────────────────────────────────────────
+                        # 1) находим первую 1H-свечу, начинающуюся в чётный час UTC
+                        start_idx = 0
+                        for j, c in enumerate(ohlcv_raw_1h):
+                            ts_hour = (c[0] // 3600_000) % 24
+                            if ts_hour % 2 == 0:
+                                start_idx = j
+                                break
+                        # 2) склеиваем парами начиная с этой позиции
                         ohlcv_2h = []
-                        for i in range(0, len(ohlcv_raw_1h) - 1, 2):
+                        for i in range(start_idx, len(ohlcv_raw_1h) - 1, 2):
                             c1 = ohlcv_raw_1h[i]
                             c2 = ohlcv_raw_1h[i + 1]
+                            # доп.проверка: c2 должна следовать ровно через час за c1
+                            if c2[0] - c1[0] != 3600_000:
+                                continue
                             merged = [
                                 c1[0],
                                 c1[1],
@@ -2333,11 +2352,8 @@ def analyst_loop():
                     if len(closed_2h) >= 3:
                         price_3back = closed_2h[-3][4]
                         recent_move_pct = abs(current_2h - price_3back) / price_3back * 100
-                        # Со знаком: + если рост, − если падение. Нужен для фильтра позднего входа
-                        move_3bars_signed = (current_2h - price_3back) / price_3back * 100
                     else:
                         recent_move_pct = 0.0
-                        move_3bars_signed = 0.0
                     already_moving = recent_move_pct > 3.0
 
                     is_sq_clean = is_sq and not already_moving and cur_vol_2h_rel < 1.5
@@ -2432,9 +2448,9 @@ def analyst_loop():
                     # раньше, на более локальных уровнях
                     # Объём остаётся MIN_VOLUME_ATTENTION = $1M
                     #
-                    # ФИЛЬТРЫ ОТ ПОЗДНИХ ВХОДОВ:
-                    # - RSI 2H ≤ 65 (если перекуплено — шанс отката высок)
-                    # - 3-bar move ≤ +5% (если уже сильно выросло — поздно входить)
+                    # ФИЛЬТР RSI: если RSI 2H > 65 — перекуплено, лонг опасен.
+                    # 3-bar move фильтр НЕ применяется: разворот от капитуляционного
+                    # лоя даёт большой move (+7-10%), но это валидный сигнал.
                     # ══════════════════════════════════════════════════
                     if (ib2_key_l not in sent_attention
                             and ib_bounce_2h >= 1.0
@@ -2442,8 +2458,7 @@ def analyst_loop():
                             and long_gate_2h
                             and near_sl_2h
                             and vol_24h_2h >= MIN_VOLUME_ATTENTION
-                            and rsi_2h <= 65
-                            and move_3bars_signed <= 5.0):
+                            and rsi_2h <= 65):
                         parts = [
                             f"⚡️ <b>РАННИЙ ЛОНГ 2H{wl_2h}</b>",
                             f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
@@ -2472,9 +2487,10 @@ def analyst_loop():
                     # ══════════════════════════════════════════════════
                     # РАННИЙ ШОРТ 2H
                     #
-                    # ФИЛЬТРЫ ОТ ПОЗДНИХ ВХОДОВ:
-                    # - RSI 2H ≥ 35 (если перепродано — шанс отскока высок)
-                    # - 3-bar move ≥ -5% (если уже сильно упало — поздно шортить)
+                    # ФИЛЬТР RSI: если RSI 2H < 35 — перепродано, шорт опасен.
+                    # 3-bar move фильтр НЕ применяется: разворот от пика после
+                    # сильного памп-движения даёт большой move (-7-10%), но это
+                    # валидный сигнал на шорт.
                     # ══════════════════════════════════════════════════
                     if (ib2_key_s not in sent_attention
                             and ib_pullback_2h >= 1.0
@@ -2482,8 +2498,7 @@ def analyst_loop():
                             and short_gate_2h
                             and near_sh_2h
                             and vol_24h_2h >= MIN_VOLUME_ATTENTION
-                            and rsi_2h >= 35
-                            and move_3bars_signed >= -5.0):
+                            and rsi_2h >= 35):
                         parts = [
                             f"⚡️ <b>РАННИЙ ШОРТ 2H{wl_2h}</b>",
                             f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
