@@ -580,6 +580,9 @@ def _rev_scan(symbol, ohlcv_4h, ohlcv_1h, vol_24h, btc_ch_4h, mode):
 
     tv = symbol.replace('/', '').replace(':USDT', '.P')
     coin = symbol.split("/")[0]
+    # Убираем STOCK для корректных ссылок (NVDASTOCK → NVDA и т.п.)
+    tv = _clean_ticker_for_chart(tv.replace('USDT.P', '')) + 'USDT.P'
+    coin = _clean_ticker_for_chart(coin)
 
     msg_lines = [
         f"{side_emoji} <b>РАЗВОРОТ 4H {side_label}</b> {arrow}",
@@ -648,7 +651,7 @@ WATCHLIST = [
 # ─────────────────────────────────────────────
 MIN_VOLUME_SIGNAL        = 5_000_000   # $5M для СИГНАЛ
 MIN_VOLUME_ATTENTION     = 1_000_000   # $1M для ВНИМАНИЕ и РАННИХ лонг/шорт 2H
-MIN_VOLUME_SQUEEZE       = 500_000     # $500K только для алерта СЖАТИЕ 2H  ← НОВОЕ
+MIN_VOLUME_SQUEEZE       = 100_000     # $100K — фильтр для алерта СЖАТИЕ 2H, низкий чтобы видеть мелкие альты до пампа
 MIN_RR_SIGNAL            = 3.0
 MIN_RR_ATTENTION         = 2.0
 MIN_TARGET_PCT_SIGNAL    = 5.0
@@ -1509,13 +1512,30 @@ def check_hammer(ohlcv, mode='long'):
         return (h - max(o,c)) / fr > 0.6 and body / fr < 0.3
 
 
+def _clean_ticker_for_chart(name: str) -> str:
+    """
+    Убирает суффикс/префикс STOCK из тикера для корректных ссылок
+    на TradingView и CoinGlass.
+    Примеры:
+        MSFTSTOCK → MSFT
+        MSFT-STOCK → MSFT
+        NVDASTOCK → NVDA
+        BTC → BTC (не меняется)
+    """
+    import re
+    return re.sub(r'[-_]?STOCK[-_]?', '', name, flags=re.IGNORECASE)
+
+
 def build_tv_link(symbol):
-    tv = symbol.replace('/', '').replace(':USDT', '.P')
+    # symbol: 'MSFTSTOCK/USDT:USDT' или 'BTC/USDT:USDT'
+    base = symbol.split('/')[0]
+    base_clean = _clean_ticker_for_chart(base)
+    tv = f"{base_clean}USDT.P"
     return f"🔗 <a href='https://www.tradingview.com/chart/?symbol=MEXC:{tv}'>TradingView</a>"
 
 
 def build_coinglass_link(symbol):
-    coin = symbol.split("/")[0]
+    coin = _clean_ticker_for_chart(symbol.split("/")[0])
     return f"📊 <a href='https://www.coinglass.com/tv/Binance_{coin}USDT'>CoinGlass СуперГрафик</a>"
 
 
@@ -1732,8 +1752,12 @@ def analyst_loop():
             except Exception as e:
                 logging.error(f"fetch_tickers: {e}"); time.sleep(60); continue
 
+            # Только USDT-пары: исключает дубликаты USDC-пар (XAUT/USDC:USDC и т.п.)
+            # и фильтрует низколиквидные альтернативные котировки.
             active_swaps = [s for s, m in exchange.markets.items()
-                            if m.get('active') and m.get('type') == 'swap']
+                            if m.get('active')
+                            and m.get('type') == 'swap'
+                            and m.get('quote') == 'USDT']
 
             vol_data = sorted(
                 [{'s': s, 'v': tickers[s].get('quoteVolume', 0)}
