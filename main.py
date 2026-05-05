@@ -651,7 +651,6 @@ WATCHLIST = [
 # ─────────────────────────────────────────────
 MIN_VOLUME_SIGNAL        = 5_000_000   # $5M для СИГНАЛ
 MIN_VOLUME_ATTENTION     = 1_000_000   # $1M для ВНИМАНИЕ и РАННИХ лонг/шорт 2H
-MIN_VOLUME_SQUEEZE       = 100_000     # $100K — фильтр для алерта СЖАТИЕ 2H, низкий чтобы видеть мелкие альты до пампа
 MIN_RR_SIGNAL            = 3.0
 MIN_RR_ATTENTION         = 2.0
 MIN_TARGET_PCT_SIGNAL    = 5.0
@@ -2265,10 +2264,12 @@ def analyst_loop():
             # ══════════════════════════════════════════════════
             # 2H СКАН
             # ══════════════════════════════════════════════════
-            top250_2h = [x['s'] for x in vol_data[:250]
-                         if tickers.get(x['s'], {}).get('quoteVolume', 0) >= MIN_VOLUME_SQUEEZE]
+            # СЖАТИЕ 2H: топ-350 активных монет, без фильтра объёма.
+            # Внимание: на низколиквидных монетах ($5-50K) ATR Map даёт ложные
+            # срабатывания. Если будет много спама — вернуть фильтр объёма.
+            top350_2h = [x['s'] for x in vol_data[:350]]
 
-            for symbol in top250_2h:
+            for symbol in top350_2h:
                 try:
                     vol_24h_2h = tickers.get(symbol, {}).get('quoteVolume', 0) or 0
 
@@ -2440,10 +2441,27 @@ def analyst_loop():
                     #  - для is_sq: cur_vol_2h < 1.5 защищает от уже разрешившегося сжатия
                     #  - для atr_map_active: фильтр НЕ применяется, потому что mature-сжатие
                     #    в длинном окне работает даже если на текущей свече всплеск объёма
+                    #
+                    # MIN_VOLUME_SQUEEZE убран — топ-350 без фильтра объёма.
                     # ══════════════════════════════════════════════════
+
+                    # Детальный лог: для каждой монеты с активным сжатием
+                    # пишем что увидел бот и какие условия выполнились.
+                    # Помогает понять почему алерт пришёл/не пришёл.
+                    if is_sq or atr_map_active:
+                        already_sent = sq2_key in sent_attention
+                        vol_filter_pass = (cur_vol_2h < 1.5 or atr_map_active)
+                        will_send = (not already_sent and vol_filter_pass)
+                        logging.info(
+                            f"СЖАТИЕ-DEBUG {symbol}: "
+                            f"is_sq={is_sq} atr_map={atr_map_score:.0f}({'+' if atr_map_active else '-'}) "
+                            f"cur_vol={cur_vol_2h:.2f} v24h={vol_24h_2h/1e6:.2f}M "
+                            f"already_sent={already_sent} vol_pass={vol_filter_pass} "
+                            f"→ {'SEND' if will_send else 'SKIP'}"
+                        )
+
                     if (sq2_key not in sent_attention
                             and (is_sq or atr_map_active)
-                            and vol_24h_2h >= MIN_VOLUME_SQUEEZE
                             and (cur_vol_2h < 1.5 or atr_map_active)):
 
                         if ssma_trend_2h in ('bull_strong', 'bull_weak') and cvd_level_2h in ('bull', 'bull_div'):
@@ -2587,7 +2605,7 @@ def analyst_loop():
             sent_attention = {k: v for k, v in sent_attention.items() if now - v < 86400}
             bot_status["iterations"]    += 1
             bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
-            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H: {len(top250_2h)} | "
+            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H: {len(top350_2h)} | "
                          f"Reversal: {bot_status['reversal_sent']} | "
                          f"Внимание: {bot_status['attention_sent']} | "
                          f"Ранних 2H: {bot_status['early_2h_sent']} | "
