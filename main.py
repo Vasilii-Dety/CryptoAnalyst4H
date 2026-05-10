@@ -1539,15 +1539,43 @@ def build_coinglass_link(symbol):
 
 
 def send_msg(text):
-    if not TELEGRAM_TOKEN or not CHAT_ID: return
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10)
-        if not r.ok: logging.error(f"TG error: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        logging.error(f"TG send error: {e}")
+    """
+    Отправляет сообщение в Telegram.
+    Возвращает True если доставлено, False при ошибке.
+    При 429 (flood control) делает до 2 retry с указанной паузой.
+    После успешной отправки делает паузу 0.5с — Telegram limit ~1 msg/sec.
+    """
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    for attempt in range(3):  # до 3 попыток
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+                timeout=10)
+            if r.ok:
+                time.sleep(0.5)  # защита от flood control при пачке алертов
+                return True
+            # 429 — flood control, ждём столько сколько просит Telegram + 2 секунды
+            if r.status_code == 429:
+                try:
+                    retry_after = r.json().get('parameters', {}).get('retry_after', 30)
+                except Exception:
+                    retry_after = 30
+                logging.warning(f"TG 429 flood control, waiting {retry_after}s (attempt {attempt+1}/3)")
+                if attempt < 2:
+                    time.sleep(retry_after + 2)
+                    continue
+            # Другие ошибки — логируем и не повторяем
+            logging.error(f"TG error: {r.status_code} {r.text[:200]}")
+            return False
+        except Exception as e:
+            logging.error(f"TG send error: {e}")
+            if attempt < 2:
+                time.sleep(5)
+                continue
+            return False
+    return False
 
 
 def get_market_context():
@@ -2068,10 +2096,10 @@ def analyst_loop():
                                 f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                                 )
                             )
-                            send_msg(msg)
-                            sent_attention[ib_key_l] = time.time()
-                            bot_status["attention_sent"] += 1
-                            logging.info(f"РАННИЙ ЛОНГ: {symbol} bounce={intrabar_bounce:.1f}% vol=x{cur_vol_rel:.1f}")
+                            if send_msg(msg):
+                                sent_attention[ib_key_l] = time.time()
+                                bot_status["attention_sent"] += 1
+                                logging.info(f"РАННИЙ ЛОНГ: {symbol} bounce={intrabar_bounce:.1f}% vol=x{cur_vol_rel:.1f}")
 
                     if (ib_key_s not in sent_attention
                             and intrabar_top_reversal
@@ -2102,10 +2130,10 @@ def analyst_loop():
                                 f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                                 )
                             )
-                            send_msg(msg)
-                            sent_attention[ib_key_s] = time.time()
-                            bot_status["attention_sent"] += 1
-                            logging.info(f"РАННИЙ ШОРТ: {symbol} pullback={intrabar_pullback:.1f}% vol=x{cur_vol_rel:.1f}")
+                            if send_msg(msg):
+                                sent_attention[ib_key_s] = time.time()
+                                bot_status["attention_sent"] += 1
+                                logging.info(f"РАННИЙ ШОРТ: {symbol} pullback={intrabar_pullback:.1f}% vol=x{cur_vol_rel:.1f}")
 
                     if (la_key not in sent_attention
                             and near_sw_low
@@ -2144,10 +2172,10 @@ def analyst_loop():
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
                                 f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                             )
-                            send_msg(msg)
-                            sent_attention[la_key] = time.time()
-                            bot_status["attention_sent"] += 1
-                            logging.info(f"ВНИМАНИЕ ЛОНГ: {symbol} score={a_score} sw_low={sw_low_pct:.1f}%")
+                            if send_msg(msg):
+                                sent_attention[la_key] = time.time()
+                                bot_status["attention_sent"] += 1
+                                logging.info(f"ВНИМАНИЕ ЛОНГ: {symbol} score={a_score} sw_low={sw_low_pct:.1f}%")
 
                     if (sa_key not in sent_attention
                             and near_sw_high
@@ -2185,10 +2213,10 @@ def analyst_loop():
                                 f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%\n"
                                 f"{build_tv_link(symbol)}\n{build_coinglass_link(symbol)}"
                             )
-                            send_msg(msg)
-                            sent_attention[sa_key] = time.time()
-                            bot_status["attention_sent"] += 1
-                            logging.info(f"ВНИМАНИЕ ШОРТ: {symbol} score={a_score} sw_high={sw_high_pct:.1f}%")
+                            if send_msg(msg):
+                                sent_attention[sa_key] = time.time()
+                                bot_status["attention_sent"] += 1
+                                logging.info(f"ВНИМАНИЕ ШОРТ: {symbol} score={a_score} sw_high={sw_high_pct:.1f}%")
 
                     # ══════════════════════════════════════════════════
                     # REVERSAL 4H — НОВЫЙ блок (заменяет старые "СИГНАЛ ЛОНГ/ШОРТ 4H")
@@ -2220,14 +2248,14 @@ def analyst_loop():
                                     logging.error(f"reversal_long {symbol}: {e}")
                                     sig = None
                                 if sig:
-                                    send_msg(sig['message'])
-                                    sent_signals[rev_l_key] = time.time()
-                                    bot_status["signals_sent"] += 1
-                                    bot_status["reversal_sent"] += 1
-                                    logging.info(
-                                        f"REVERSAL ЛОНГ: {symbol} entry={sig['entry']:.6g} "
-                                        f"tgt={sig['target_pct']:+.2f}% rr={sig['rr']:.2f}"
-                                    )
+                                    if send_msg(sig['message']):
+                                        sent_signals[rev_l_key] = time.time()
+                                        bot_status["signals_sent"] += 1
+                                        bot_status["reversal_sent"] += 1
+                                        logging.info(
+                                            f"REVERSAL ЛОНГ: {symbol} entry={sig['entry']:.6g} "
+                                            f"tgt={sig['target_pct']:+.2f}% rr={sig['rr']:.2f}"
+                                        )
 
                             # ─── REVERSAL ШОРТ ───
                             if need_rev_short:
@@ -2243,14 +2271,14 @@ def analyst_loop():
                                     logging.error(f"reversal_short {symbol}: {e}")
                                     sig = None
                                 if sig:
-                                    send_msg(sig['message'])
-                                    sent_signals[rev_s_key] = time.time()
-                                    bot_status["signals_sent"] += 1
-                                    bot_status["reversal_sent"] += 1
-                                    logging.info(
-                                        f"REVERSAL ШОРТ: {symbol} entry={sig['entry']:.6g} "
-                                        f"tgt={sig['target_pct']:+.2f}% rr={sig['rr']:.2f}"
-                                    )
+                                    if send_msg(sig['message']):
+                                        sent_signals[rev_s_key] = time.time()
+                                        bot_status["signals_sent"] += 1
+                                        bot_status["reversal_sent"] += 1
+                                        logging.info(
+                                            f"REVERSAL ШОРТ: {symbol} entry={sig['entry']:.6g} "
+                                            f"tgt={sig['target_pct']:+.2f}% rr={sig['rr']:.2f}"
+                                        )
 
                     time.sleep(0.15)
 
@@ -2370,298 +2398,4 @@ def analyst_loop():
                     ib_high_2h     = cur_2h[2]
                     ib_low_2h      = cur_2h[3]
                     ib_bounce_2h   = (current_2h - ib_low_2h)  / ib_low_2h  * 100 if ib_low_2h  > 0 else 0.0
-                    ib_pullback_2h = (ib_high_2h - current_2h) / ib_high_2h * 100 if ib_high_2h > 0 else 0.0
-                    cur_vol_2h     = cur_2h[5] / v_avg_2h if v_avg_2h > 0 else 1.0
-
-                    ssma_2h, ssma_trend_2h, ssma_slope_2h = calculate_ssma(closed_2h, period=24)
-                    long_gate_2h  = ssma_allows_long(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
-                    short_gate_2h = ssma_allows_short(ssma_2h, ssma_trend_2h, ssma_slope_2h, current_2h)
-
-                    # ── ИЗМЕНЕНИЕ 3: swing_bars=5 вместо 10 ──────────────────
-                    # Было: swing_bars=10 → окно 20 свечей = 40 часов
-                    # Стало: swing_bars=5 → окно 10 свечей = 20 часов
-                    # Уровни более локальные → near_sl/sh срабатывает раньше
-                    # → ранний лонг/шорт приходит до движения, не в момент
-                    sw_lp_2h, sw_hp_2h, near_sl_2h, near_sh_2h, sw_l_2h, sw_h_2h = \
-                        calculate_swing_hilo(ohlcv_2h, swing_bars=SWING_BARS_2H)
-
-                    cvd_level_2h, _ = calc_cvd_level(closed_2h)
-                    cvd_emoji_2h = {"bull":"🟢","bull_div":"🟢✨",
-                                    "bear":"🔴","bear_div":"🔴✨"}.get(cvd_level_2h, "⚪️")
-
-                    is_sq, sq_ratio, sq_slope, sq_bars, sq_label = \
-                        detect_volatility_squeeze(closed_2h, period=3, avg_period=50)
-
-                    atr_map_score, atr_map_forming, atr_map_mature, atr_map_label, atr_map_comp = \
-                        detect_atr_map_squeeze(closed_2h)
-
-                    atr_map_active = atr_map_forming
-
-                    cur_vol_2h_rel = (ohlcv_2h[-1][5] /
-                        (sum(x[5] for x in closed_2h[-20:]) / 20)
-                        if closed_2h else 1.0)
-
-                    if len(closed_2h) >= 3:
-                        price_3back = closed_2h[-3][4]
-                        recent_move_pct = abs(current_2h - price_3back) / price_3back * 100
-                    else:
-                        recent_move_pct = 0.0
-                    already_moving = recent_move_pct > 3.0
-
-                    is_sq_clean = is_sq and not already_moving and cur_vol_2h_rel < 1.5
-
-                    # Исключение SSMA ворот
-                    if (not long_gate_2h and is_sq
-                            and cvd_level_2h in ('bull', 'bull_div')
-                            and ib_bounce_2h >= 1.5):
-                        long_gate_2h = True
-                    if (not short_gate_2h and is_sq
-                            and cvd_level_2h in ('bear', 'bear_div')
-                            and ib_pullback_2h >= 1.5):
-                        short_gate_2h = True
-
-                    wl_2h = " ⭐️" if symbol in WATCHLIST else ""
-                    ssma_lbl_2h = ""
-                    if ssma_2h:
-                        icon = "📈" if 'bull' in ssma_trend_2h else "📉"
-                        ssma_lbl_2h = f"{icon} SSMA 2H: {ssma_2h:.4g} ({ssma_slope_2h:+.2f}%/св)"
-
-                    tv = build_tv_link(symbol)
-                    cg = build_coinglass_link(symbol)
-                    btc_line = f"👑 BTC: {ctx['btc_trend']} {ctx['btc_ch']:.1f}%"
-                    vol_line = f"📦 Объём 24H: ${vol_24h_2h/1_000_000:.1f}M"
-
-                    # ══════════════════════════════════════════════════
-                    # СЖАТИЕ 2H
-                    # is_sq → триггер по короткому окну (3 свечи)
-                    # atr_map_active → триггер по длинному окну (компрессия 50+ свечей)
-                    # Оба независимы и часто срабатывают на разных монетах.
-                    #
-                    # Фильтр объёма:
-                    #  - для is_sq: cur_vol_2h < 1.5 защищает от уже разрешившегося сжатия
-                    #  - для atr_map_active: фильтр НЕ применяется, потому что mature-сжатие
-                    #    в длинном окне работает даже если на текущей свече всплеск объёма
-                    #
-                    # MIN_VOLUME_SQUEEZE убран — топ-350 без фильтра объёма.
-                    # ══════════════════════════════════════════════════
-
-                    # Детальный лог: для каждой монеты с активным сжатием
-                    # пишем что увидел бот и какие условия выполнились.
-                    # Помогает понять почему алерт пришёл/не пришёл.
-                    if is_sq or atr_map_active:
-                        already_sent = sq2_key in sent_attention
-                        vol_filter_pass = (cur_vol_2h < 1.5 or atr_map_active)
-                        will_send = (not already_sent and vol_filter_pass)
-                        logging.info(
-                            f"СЖАТИЕ-DEBUG {symbol}: "
-                            f"is_sq={is_sq} atr_map={atr_map_score:.0f}({'+' if atr_map_active else '-'}) "
-                            f"cur_vol={cur_vol_2h:.2f} v24h={vol_24h_2h/1e6:.2f}M "
-                            f"already_sent={already_sent} vol_pass={vol_filter_pass} "
-                            f"→ {'SEND' if will_send else 'SKIP'}"
-                        )
-
-                    if (sq2_key not in sent_attention
-                            and (is_sq or atr_map_active)
-                            and (cur_vol_2h < 1.5 or atr_map_active)):
-
-                        if ssma_trend_2h in ('bull_strong', 'bull_weak') and cvd_level_2h in ('bull', 'bull_div'):
-                            sq_direction = "⚡️ Вероятный взрыв: ВВЕРХ 📈"
-                        elif ssma_trend_2h in ('bear_strong', 'bear_weak') and cvd_level_2h in ('bear', 'bear_div'):
-                            sq_direction = "⚡️ Вероятный взрыв: ВНИЗ 📉"
-                        elif cvd_level_2h in ('bull_div', 'bull') and sq_slope > 0:
-                            sq_direction = "⚡️ Вероятный взрыв: ВВЕРХ 📈 (CVD)"
-                        elif cvd_level_2h in ('bear_div', 'bear') and sq_slope < 0:
-                            sq_direction = "⚡️ Вероятный взрыв: ВНИЗ 📉 (CVD)"
-                        else:
-                            sq_direction = "⚪️ Направление не определено — смотри пробой"
-
-                        # Строим блок — показываем то что сработало
-                        sq_block = []
-                        if is_sq_clean:
-                            sq_block.append(sq_label)
-                        if atr_map_active:
-                            maturity = "🟠 ЗРЕЛОЕ" if atr_map_mature else "🟡 формируется"
-                            sq_block.append(
-                                f"📊 ATR Map: {atr_map_score:.0f}/100 {maturity}\n"
-                                f"   ATR x{atr_map_comp['atr_ratio']:.2f} | "
-                                f"Range {atr_map_comp['range']:.0f} | "
-                                f"Noise {atr_map_comp['noise']:.0f} | "
-                                f"Cont {atr_map_comp['containment']:.0f}"
-                            )
-
-                        msg = "\n".join([
-                            f"🗜 <b>СЖАТИЕ 2H{wl_2h}</b>",
-                            f"Монета: <b>{symbol}</b>",
-                            f"Цена: <code>{current_2h:.6g}</code>",
-                            "───────────────────",
-                            *sq_block,
-                            sq_direction,
-                            "───────────────────",
-                            ssma_lbl_2h,
-                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
-                            f"📊 RSI 2H: {rsi_2h:.1f}",
-                            vol_line,
-                            "───────────────────",
-                            btc_line,
-                            tv,
-                            cg
-                        ])
-                        send_msg(msg)
-                        sent_attention[sq2_key] = time.time()
-                        bot_status["early_2h_sent"] += 1
-                        logging.info(f"СЖАТИЕ 2H: {symbol} is_sq={is_sq} atr_map={atr_map_score:.0f} ratio={sq_ratio:.2f}")
-
-                    # ══════════════════════════════════════════════════
-                    # РАННИЙ ЛОНГ 2H
-                    # ИЗМЕНЕНИЕ 3: swing_bars=5 → near_sl_2h срабатывает
-                    # раньше, на более локальных уровнях
-                    # Объём остаётся MIN_VOLUME_ATTENTION = $1M
-                    #
-                    # ФИЛЬТР RSI: если RSI 2H > 65 — перекуплено, лонг опасен.
-                    # 3-bar move фильтр НЕ применяется: разворот от капитуляционного
-                    # лоя даёт большой move (+7-10%), но это валидный сигнал.
-                    # ══════════════════════════════════════════════════
-                    if (ib2_key_l not in sent_attention
-                            and ib_bounce_2h >= 1.0
-                            and cur_vol_2h >= 1.2
-                            and long_gate_2h
-                            and near_sl_2h
-                            and vol_24h_2h >= MIN_VOLUME_ATTENTION
-                            and rsi_2h <= 65):
-                        parts = [
-                            f"⚡️ <b>РАННИЙ ЛОНГ 2H{wl_2h}</b>",
-                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
-                            f"Цена: <code>{current_2h:.6g}</code>",
-                            f"Отскок от лоя: +{ib_bounce_2h:.1f}% | Объём: x{cur_vol_2h:.1f}",
-                            f"Swing Low 2H: +{sw_lp_2h:.1f}%",
-                            "───────────────────",
-                            ssma_lbl_2h,
-                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
-                            f"📊 RSI 2H: {rsi_2h:.1f}",
-                            vol_line,
-                        ]
-                        if is_sq:
-                            parts.append(sq_label)
-                        parts += [
-                            "───────────────────",
-                            "⚠️ Свеча 2H не закрыта — ждите подтверждения",
-                            btc_line, tv,
-                            cg
-                        ]
-                        send_msg("\n".join(parts))
-                        sent_attention[ib2_key_l] = time.time()
-                        bot_status["early_2h_sent"] += 1
-                        logging.info(f"РАННИЙ ЛОНГ 2H: {symbol} bounce={ib_bounce_2h:.1f}% swing_bars={SWING_BARS_2H}")
-
-                    # ══════════════════════════════════════════════════
-                    # РАННИЙ ШОРТ 2H
-                    #
-                    # ФИЛЬТР RSI: если RSI 2H < 35 — перепродано, шорт опасен.
-                    # 3-bar move фильтр НЕ применяется: разворот от пика после
-                    # сильного памп-движения даёт большой move (-7-10%), но это
-                    # валидный сигнал на шорт.
-                    # ══════════════════════════════════════════════════
-                    if (ib2_key_s not in sent_attention
-                            and ib_pullback_2h >= 1.0
-                            and cur_vol_2h >= 1.2
-                            and short_gate_2h
-                            and near_sh_2h
-                            and vol_24h_2h >= MIN_VOLUME_ATTENTION
-                            and rsi_2h >= 35):
-                        parts = [
-                            f"⚡️ <b>РАННИЙ ШОРТ 2H{wl_2h}</b>",
-                            f"Монета: <b>{symbol}</b> | 🕯 Внутри 2H свечи",
-                            f"Цена: <code>{current_2h:.6g}</code>",
-                            f"Откат от хая: -{ib_pullback_2h:.1f}% | Объём: x{cur_vol_2h:.1f}",
-                            f"Swing High 2H: -{sw_hp_2h:.1f}%",
-                            "───────────────────",
-                            ssma_lbl_2h,
-                            f"{cvd_emoji_2h} CVD 2H: <b>{cvd_level_2h}</b>",
-                            f"📊 RSI 2H: {rsi_2h:.1f}",
-                            vol_line,
-                        ]
-                        if is_sq:
-                            parts.append(sq_label)
-                        parts += [
-                            "───────────────────",
-                            "⚠️ Свеча 2H не закрыта — ждите подтверждения",
-                            btc_line, tv,
-                            cg
-                        ]
-                        send_msg("\n".join(parts))
-                        sent_attention[ib2_key_s] = time.time()
-                        bot_status["early_2h_sent"] += 1
-                        logging.info(f"РАННИЙ ШОРТ 2H: {symbol} pullback={ib_pullback_2h:.1f}% swing_bars={SWING_BARS_2H}")
-
-                except ccxt.RateLimitExceeded:
-                    logging.warning(f"Rate limit 2H {symbol}, пауза 30с"); time.sleep(30)
-                except ccxt.NetworkError as e:
-                    logging.error(f"Network 2H {symbol}: {e}")
-                except Exception as e:
-                    logging.error(f"Ошибка 2H {symbol}: {e}")
-
-            now = time.time()
-            sent_signals   = {k: v for k, v in sent_signals.items()   if now - v < 86400}
-            sent_attention = {k: v for k, v in sent_attention.items() if now - v < 86400}
-            bot_status["iterations"]    += 1
-            bot_status["last_iteration"] = datetime.now().strftime('%H:%M:%S')
-            logging.info(f"Итерация. Символов 4H: {len(symbols)} | 2H: {len(top350_2h)} | "
-                         f"Reversal: {bot_status['reversal_sent']} | "
-                         f"Внимание: {bot_status['attention_sent']} | "
-                         f"Ранних 2H: {bot_status['early_2h_sent']} | "
-                         f"BTC vol: {ctx['btc_vol']:.2f}%")
-            time.sleep(300)
-
-        except ccxt.NetworkError as e:
-            logging.error(f"Глобальная сеть: {e}"); bot_status["errors"] += 1; time.sleep(60)
-        except Exception as e:
-            logging.error(f"Критическая ошибка: {e}"); bot_status["errors"] += 1; time.sleep(60)
-
-
-@app.route('/health')
-def health():
-    uptime = str(datetime.now() - datetime.fromisoformat(bot_status["started_at"])).split('.')[0]
-    return (f"✅ OK | v6.2 (REVERSAL_4H)\n"
-            f"Uptime: {uptime}\n"
-            f"Итераций: {bot_status['iterations']}\n"
-            f"Ошибок: {bot_status['errors']}\n"
-            f"Reversal 4H 🚨: {bot_status['reversal_sent']}\n"
-            f"Внимание 🔔: {bot_status['attention_sent']}\n"
-            f"Ранних 2H: {bot_status['early_2h_sent']}\n"
-            f"Последняя итерация: {bot_status['last_iteration']}")
-
-
-def keepalive_loop():
-    time.sleep(30)
-    port         = int(os.environ.get("PORT", 10000))
-    external_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-    local_url    = f"http://localhost:{port}/health"
-    while True:
-        for url in ([f"{external_url}/health"] if external_url else []) + [local_url]:
-            try:
-                r = requests.get(url, timeout=15)
-                logging.info(f"Keepalive [{url}]: {r.status_code}"); break
-            except Exception as e:
-                logging.warning(f"Keepalive [{url}]: {e}")
-        time.sleep(240)
-
-
-def watchdog():
-    time.sleep(60)
-    while True:
-        global analyst_thread
-        if not analyst_thread.is_alive():
-            logging.error("analyst_loop упал, перезапуск...")
-            bot_status["errors"] += 1
-            analyst_thread = threading.Thread(target=analyst_loop, daemon=True, name="analyst")
-            analyst_thread.start()
-        time.sleep(60)
-
-
-analyst_thread = threading.Thread(target=analyst_loop, daemon=True, name="analyst")
-analyst_thread.start()
-threading.Thread(target=keepalive_loop, daemon=True, name="keepalive").start()
-threading.Thread(target=watchdog,       daemon=True, name="watchdog").start()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+                    ib_pullback_2h = (ib_high_2h - current_2h) / ib_high_2h * 100 if ib_high_2h 
