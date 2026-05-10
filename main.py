@@ -2398,4 +2398,4 @@ def analyst_loop():
                     ib_high_2h     = cur_2h[2]
                     ib_low_2h      = cur_2h[3]
                     ib_bounce_2h   = (current_2h - ib_low_2h)  / ib_low_2h  * 100 if ib_low_2h  > 0 else 0.0
-                    ib_pullback_2h = (ib_high_2h - current_2h) / ib_high_2h * 100 if ib_high_2h 
+                    ib_pullback_2h = (ib_high_2h - current_2h) / ib_high_2h * 100 if ib_high_2h > 0 else 0.0
